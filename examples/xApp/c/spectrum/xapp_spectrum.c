@@ -274,6 +274,23 @@ static void send_control_message(e2_node_arr_xapp_t nodes,
 }
 
 /**
+ * @brief dApp the spectrum controls are addressed to.
+ *
+ * [srs-sharing] E3 agents number their dApps differently (OAI from 1, OCUDU from 101), so the
+ * target can be set with the DAPP_ID environment variable; it defaults to 1 as before.
+ */
+static uint32_t control_target_dapp_id(void)
+{
+  const char* env = getenv("DAPP_ID");
+  if (env == NULL || *env == '\0')
+    return 1;
+  char* end = NULL;
+  unsigned long id = strtoul(env, &end, 10);
+  assert(end != NULL && *end == '\0' && id <= UINT32_MAX && "DAPP_ID must be an unsigned integer");
+  return (uint32_t)id;
+}
+
+/**
  * @brief Build and send a test Spectrum SM control message.
  *
  * Selects a predefined PRB blacklist variant (cycling through
@@ -308,7 +325,7 @@ static void generate_control_message_spectrum(e2_node_arr_xapp_t nodes, unsigned
   payload.type = DAPP_E3_SM_SPECTRUM;
   payload.u.spectrum = ctrl;
 
-  send_control_message(nodes, DAPP_SM_ID, E3_RAN_FUNC_ID_SPECTRUM, /*dapp_id=*/1, &payload);
+  send_control_message(nodes, DAPP_SM_ID, E3_RAN_FUNC_ID_SPECTRUM, control_target_dapp_id(), &payload);
 }
 
 /* ------------------------------------------------------------------ */
