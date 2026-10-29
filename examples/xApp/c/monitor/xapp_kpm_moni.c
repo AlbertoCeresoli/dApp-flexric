@@ -550,6 +550,12 @@ int main(int argc, char* argv[])
     assert(hndl[i] != NULL);
     for (size_t j = 0; j < sz_report_styles; j++) {
       ric_report_style_item_t *report_item = &n->rf[idx].defn.kpm.ric_report_style_list[j];
+      // Skip report styles this example does not implement (an E2 node may advertise all five).
+      if (get_kpm_act_def[report_item->report_style_type] == NULL) {
+        printf("[xApp]: skipping KPM report style %d (not implemented in this example)\n",
+               (int)report_item->report_style_type + 1);
+        continue;
+      }
       // Generate KPM SUBSCRIPTION message
       kpm_sub_data_t kpm_sub = gen_kpm_subs(&n->rf[idx].defn.kpm, report_item);
 

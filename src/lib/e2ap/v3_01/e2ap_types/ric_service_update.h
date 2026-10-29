@@ -26,6 +26,7 @@
 
 #include "common/e2ap_ran_function.h"
 #include "common/e2ap_ran_function_id_rev.h"
+#include "common/e2ap_global_node_id.h"
 
 typedef struct {
   uint8_t trans_id;
@@ -38,6 +39,10 @@ typedef struct {
 
   e2ap_ran_function_id_rev_t* deleted;
   size_t len_deleted;
+
+  // Not on the wire: the RIC fills it from the SCTP association that delivered the update (near_ric.c), as in
+  // E2AP v2.03 since the E2SM-DAPP v2 commit, which only added it there.
+  global_e2_node_id_t e2_node_id;
 } ric_service_update_t;
 
 bool eq_ric_service_update(const ric_service_update_t* m0, const ric_service_update_t* m1);
