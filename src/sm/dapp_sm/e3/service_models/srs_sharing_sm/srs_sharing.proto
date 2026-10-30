@@ -1,0 +1,219 @@
+// [srs-sharing] SRS sharing service model: the payload exchanged between dApps (over E3) and an xApp (over
+// E2SM-DAPP) so that a gNB can receive the SRS of UEs served by another gNB, possibly of another operator.
+//
+// Transport. Every payload is one SrsSharingMessage, carried opaquely:
+//   dApp -> gNB:  E3 dApp Report on the E3 RAN function RAN_FUNCTION_SRS_SHARING
+//   gNB -> xApp:  E2SM-DAPP indication, report style 1 (header: node, dApp ID, E3 RAN function)
+//   xApp -> gNB:  E2SM-DAPP control, style 1 (header: dApp ID, E3 RAN function)
+//   gNB -> dApp:  E3 xApp Control Action on the same E3 RAN function
+// E2SM-DAPP has no sequence identifier, so correlation (Header.sequence) is carried here.
+//
+// Roles are symmetric: any gNB's dApp can report its own UEs (SrsConfigReport, TimingAdvanceIndicationMessage)
+// and receive other gNBs' UEs (ForeignUeUpdate). Every UE is therefore named with its serving gNB (UeRef).
+//
+// Naming. SRS fields use the TS 38.331 SRS-Resource field names in snake_case (srs-ResourceId ->
+// srs_resource_id, transmissionComb -> transmission_comb, ...). Timing advance messages reuse the names of the
+// RUN-O-RAN service model (Bernazzoli, Ceresoli, Filippini, arXiv:2609.20640,
+// github.com/viola-bernazzoli/RUN-O-RAN proto/srs_messages.proto): TimingAdvanceSource, TimingAdvanceData,
+// TimingAdvanceIndicationMessage, and the fields rnti, timestamp, timing_advance, source. Names are shared, the
+// wire format is not: this is a separate package with its own field numbers.
+//
+// Time. All timestamps are host CLOCK_MONOTONIC in microseconds, as RUN-O-RAN's "timestamp in microseconds".
+// The gNBs exchanging these messages must share that clock (one host) or a disciplined time base (PTP/GPS).
+//
+// Compatibility. proto3 without the "optional" keyword, so protoc 3.12 and protobuf-c 1.3 accept it; presence is
+// expressed with sub-messages. New fields only get new numbers; Header.schema_version changes on breaking edits.
+
+syntax = "proto3";
+
+package srs_sharing.v1;
+
+// E3 RAN function carrying these messages. Next to the ones already in use: 0..2 by the OAI dApp library
+// (1 = spectrum, also FlexRIC's spectrum SM), 10 and 11 by the OCUDU dApp platform (telemetry, management).
+enum RanFunction {
+  RAN_FUNCTION_UNSPECIFIED = 0;
+  RAN_FUNCTION_SRS_SHARING = 20;
+}
+
+// Version of this schema written in Header.schema_version.
+enum SchemaVersion {
+  SCHEMA_VERSION_UNSPECIFIED = 0;
+  SCHEMA_VERSION_1 = 1;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------------------------------------------
+
+// The only top-level message: one per E3 report or xApp control.
+message SrsSharingMessage {
+  Header header = 1;
+  oneof body {
+    SrsConfigReport srs_config_report = 2;                       // dApp -> xApp
+    TimingAdvanceIndicationMessage timing_advance_indication = 3; // dApp -> xApp
+    ForeignUeUpdate foreign_ue_update = 4;                        // xApp -> dApp
+  }
+}
+
+message Header {
+  uint32 schema_version = 1;  // SchemaVersion
+  uint64 sequence = 2;        // Per sender, increasing; a reply or a derived control may echo the sequence it reacts to
+  uint64 timestamp = 3;       // Send time, µs host monotonic
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Identities
+// ---------------------------------------------------------------------------------------------------------------
+
+// The gNB and cell serving a UE.
+message CellRef {
+  string plmn_identity = 1;  // MCC + MNC digits, e.g. "00101" (TS 38.331 PLMN-Identity)
+  uint64 gnb_id = 2;         // gNB-ID (TS 38.413), value
+  uint32 gnb_id_length = 3;  // gNB-ID length in bits (22..32)
+  uint32 phys_cell_id = 4;   // PhysCellId, 0..1007
+}
+
+// A UE context at its serving cell. The C-RNTI is only unique within a cell and while the context lives, so a UE is
+// (cell, rnti), and its configurations are told apart by SrsConfigReport.config_epoch.
+message UeRef {
+  CellRef serving_cell = 1;
+  uint32 rnti = 2;      // C-RNTI, sent in clear in this version
+  uint32 ue_index = 3;  // DU UE index at the serving gNB (diagnostics; as RUN-O-RAN TimingAdvanceData.ue_index)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// SRS resource (TS 38.331 SRS-Resource, periodic resources)
+// ---------------------------------------------------------------------------------------------------------------
+
+message SrsResource {
+  uint32 srs_resource_id = 1;                     // srs-ResourceId
+  uint32 nrof_srs_ports = 2;                      // nrofSRS-Ports: 1, 2 or 4
+  TransmissionComb transmission_comb = 3;         // transmissionComb
+  ResourceMapping resource_mapping = 4;           // resourceMapping
+  uint32 freq_domain_position = 5;                // freqDomainPosition, 0..67 (RUN-O-RAN: none)
+  uint32 freq_domain_shift = 6;                   // freqDomainShift, 0..268 (RUN-O-RAN: freq_domain_shift)
+  FreqHopping freq_hopping = 7;                   // freqHopping
+  GroupOrSequenceHopping group_or_sequence_hopping = 8;  // groupOrSequenceHopping
+  PeriodicityAndOffset periodicity_and_offset = 9;       // resourceType periodic: periodicityAndOffset-p
+  uint32 sequence_id = 10;                        // sequenceId, 0..1023
+}
+
+message TransmissionComb {
+  uint32 comb = 1;          // n2, n4 or n8 as 2, 4 or 8 (RUN-O-RAN: tx_comb)
+  uint32 comb_offset = 2;   // combOffset-n2/n4/n8
+  uint32 cyclic_shift = 3;  // cyclicShift-n2/n4/n8
+}
+
+message ResourceMapping {
+  uint32 start_position = 1;     // startPosition, 0..13, symbols counted back from the end of the slot
+  uint32 nrof_symbols = 2;       // nrofSymbols: 1, 2 or 4 (RUN-O-RAN: num_occupied_ofdm_symbols)
+  uint32 repetition_factor = 3;  // repetitionFactor: 1, 2 or 4
+}
+
+// Frequency hopping is on when b_hop < b_srs (TS 38.211 6.4.1.4.3); there is no separate flag
+// (RUN-O-RAN: frequency_hopping_enabled).
+message FreqHopping {
+  uint32 c_srs = 1;  // c-SRS, 0..63 (RUN-O-RAN: c_srs)
+  uint32 b_srs = 2;  // b-SRS, 0..3 (RUN-O-RAN: b_srs)
+  uint32 b_hop = 3;  // b-hop, 0..3
+}
+
+enum GroupOrSequenceHopping {
+  GROUP_OR_SEQUENCE_HOPPING_NEITHER = 0;
+  GROUP_OR_SEQUENCE_HOPPING_GROUP_HOPPING = 1;
+  GROUP_OR_SEQUENCE_HOPPING_SEQUENCE_HOPPING = 2;
+}
+
+// The resource is sent in the slots where (frame * slots_per_frame + slot - offset) mod period == 0
+// (TS 38.211 6.4.1.4.4). (RUN-O-RAN: periodicity_slots, periodicity_offset.)
+message PeriodicityAndOffset {
+  uint32 period = 1;  // slots: 1, 2, 4, 5, 8, 10, 16, 20, 32, 40, 64, 80, 160, 320, 640, 1280, 2560
+  uint32 offset = 2;  // 0..period-1
+}
+
+// Uplink context needed to place the resource: numerology, the BWP it is defined in, and the timing advance offset.
+message UplinkContext {
+  uint32 subcarrier_spacing = 1;      // numerology µ (15·2^µ kHz)
+  uint32 bwp_start_rb = 2;            // BWP-Uplink locationAndBandwidth: first common RB
+  uint32 bwp_size_rb = 3;             // and number of RBs (RUN-O-RAN: ul_bandwidth_prb)
+  uint32 n_timing_advance_offset = 4; // n-TimingAdvanceOffset as N_TA,offset in units of T_c: 0, 25600 or 39936
+}
+
+// One (frame, slot) of the serving gNB and the host time it started, so that another gNB can turn the serving gNB's
+// slot numbers (periodicity_and_offset, TA command slots) into absolute time.
+message SlotAnchor {
+  uint32 sfn = 1;
+  uint32 slot = 2;
+  uint64 timestamp = 3;  // µs host monotonic
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// dApp -> xApp: the serving gNB's UE configurations and timing advance commands
+// ---------------------------------------------------------------------------------------------------------------
+
+// Event that produced an SrsConfigReport; same codes as the OCUDU platform's srs.config stream.
+enum ConfigEvent {
+  CONFIG_EVENT_UNSPECIFIED = 0;
+  CONFIG_EVENT_CREATED = 1;       // UE context created
+  CONFIG_EVENT_RECONFIGURED = 2;  // configuration changed
+  CONFIG_EVENT_APPLIED = 3;       // the UE confirmed the reconfiguration
+  CONFIG_EVENT_REMOVED = 4;       // UE context removed: stop using every earlier epoch
+  CONFIG_EVENT_SNAPSHOT = 5;      // current state, sent when a reporter starts
+}
+
+message SrsConfigReport {
+  UeRef ue = 1;
+  uint64 config_epoch = 2;    // Changes on every (re)allocation or release at the serving gNB
+  ConfigEvent event = 3;
+  UplinkContext uplink = 4;
+  SrsResource resource = 5;   // Absent: no periodic SRS configured (or event REMOVED)
+  SlotAnchor anchor = 6;
+}
+
+// Source of a timing advance command (RUN-O-RAN TimingAdvanceSource; same codes as the OCUDU ta.command stream).
+enum TimingAdvanceSource {
+  TIMING_ADVANCE_SOURCE_UNKNOWN = 0;
+  TIMING_ADVANCE_SOURCE_RAR = 1;           // TA_RA in the random access response (absolute)
+  TIMING_ADVANCE_SOURCE_CONNECTED_UE = 2;  // TA_k in a Timing Advance Command MAC CE (relative)
+}
+
+// One timing advance command (RUN-O-RAN TimingAdvanceData). The UE's cumulative N_TA in steps of 16·64·T_c/2^µ is
+// TA_RA + Σ (TA_k − 31) (TS 38.213 4.2; RUN-O-RAN Eqs. 1-2).
+message TimingAdvanceData {
+  UeRef ue = 1;                    // ue.rnti is RUN-O-RAN's rnti
+  uint64 timestamp = 2;            // µs host monotonic
+  uint32 timing_advance = 3;       // TA_RA 0..3846 (RAR) or TA_k 0..63 (MAC CE)
+  TimingAdvanceSource source = 4;
+  uint32 tag_id = 5;               // Timing advance group of the MAC CE
+  uint32 sfn = 6;                  // Slot the command was sent in
+  uint32 slot = 7;
+  uint32 subcarrier_spacing = 8;   // numerology µ, sets the step size
+}
+
+message TimingAdvanceIndicationMessage {
+  repeated TimingAdvanceData timing_advance_data = 1;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// xApp -> dApp: a UE of another gNB to receive
+// ---------------------------------------------------------------------------------------------------------------
+
+// The xApp's timing advance ledger for one UE (RUN-O-RAN III-C2).
+message TimingAdvanceState {
+  int64 n_ta_steps = 1;               // Cumulative TA_RA + Σ (TA_k − 31), in steps of 16·64·T_c/2^µ
+  uint32 nof_commands = 2;            // Commands folded in, the RAR included
+  uint64 last_command_timestamp = 3;  // µs host monotonic
+  bool missed_command_suspected = 4;  // The plausibility check failed: a command was probably lost
+}
+
+// Everything a receiving gNB needs to find and track a foreign UE's SRS. Each update replaces the previous one for
+// the same (ue, config_epoch); a newer epoch supersedes older ones; released ends the UE.
+message ForeignUeUpdate {
+  UeRef ue = 1;
+  uint64 config_epoch = 2;
+  UplinkContext uplink = 3;
+  SrsResource resource = 4;
+  SlotAnchor anchor = 5;
+  TimingAdvanceState timing_advance = 6;
+  bool released = 7;
+}
