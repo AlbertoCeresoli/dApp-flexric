@@ -7,6 +7,8 @@
 #include "../../../../src/sm/dapp_sm/e3/service_models/spectrum_sm/asn/encoder.h"
 #include "../../../../src/sm/dapp_sm/e3/service_models/spectrum_sm/asn/decoder.h"
 #include "../../../rnd/fill_rnd_data_dapp.h"
+#include "../../../../src/sm/dapp_sm/dapp_sm_ric.h"
+#include "../../../../src/sm/sm_proc_data.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -397,11 +399,96 @@ static void test_dapp_dec_e3_indication_dispatch(void)
   free_spectrum_sm_report(&in);
 }
 
+/* ===========================================================================
+ * [srs-sharing] RIC-side handlers with E3 service models this plugin has no codec for
+ * =========================================================================== */
+
+/* An E3 data report on an E3 RAN function other than spectrum is passed on as raw bytes instead of aborting. */
+static void test_ric_indication_unknown_e3_ran_function(void)
+{
+  sm_ric_t* sm = make_dapp_sm_ric();
+  defer({ sm->free_sm(sm); });
+
+  uint8_t payload[] = {0x0a, 0x04, 0x08, 0x01, 0x10, 0x07};
+  e2sm_dapp_ind_hdr_t hdr = {.format = FORMAT_1_E2SM_DAPP_IND_HDR,
+                             .frmt_1 = {.ran_function_id = 20, .dapp_id = 101, .node_type = 7, .node_nb_id = 411}};
+  e2sm_dapp_ind_msg_t msg = {.format = FORMAT_1_E2SM_DAPP_IND_MSG,
+                             .frmt_1 = {.data_size = sizeof(payload), .data = payload}};
+  byte_array_t ba_hdr = dapp_enc_ind_hdr_asn(&hdr);
+  defer({ free_byte_array(ba_hdr); });
+  byte_array_t ba_msg = dapp_enc_ind_msg_asn(&msg);
+  defer({ free_byte_array(ba_msg); });
+
+  sm_ind_data_t in = {.ind_hdr = ba_hdr.buf, .len_hdr = ba_hdr.len, .ind_msg = ba_msg.buf, .len_msg = ba_msg.len};
+  sm_ag_if_rd_ind_t out = sm->proc.on_indication(sm, &in);
+  assert(out.dapp.ind.e3.type == DAPP_E3_SM_NONE);
+  assert(out.dapp.ind.hdr.frmt_1.ran_function_id == 20);
+  assert(out.dapp.ind.msg.frmt_1.data_size == sizeof(payload));
+  assert(memcmp(out.dapp.ind.msg.frmt_1.data, payload, sizeof(payload)) == 0);
+  sm->alloc.free_ind_data(&out);
+}
+
+/* A spectrum report that does not decode is passed on as raw bytes too. */
+static void test_ric_indication_undecodable_spectrum(void)
+{
+  sm_ric_t* sm = make_dapp_sm_ric();
+  defer({ sm->free_sm(sm); });
+
+  uint8_t garbage[] = {0xff, 0xff, 0xff};
+  e2sm_dapp_ind_hdr_t hdr = {.format = FORMAT_1_E2SM_DAPP_IND_HDR, .frmt_1 = {.ran_function_id = 1, .dapp_id = 1}};
+  e2sm_dapp_ind_msg_t msg = {.format = FORMAT_1_E2SM_DAPP_IND_MSG,
+                             .frmt_1 = {.data_size = sizeof(garbage), .data = garbage}};
+  byte_array_t ba_hdr = dapp_enc_ind_hdr_asn(&hdr);
+  defer({ free_byte_array(ba_hdr); });
+  byte_array_t ba_msg = dapp_enc_ind_msg_asn(&msg);
+  defer({ free_byte_array(ba_msg); });
+
+  sm_ind_data_t in = {.ind_hdr = ba_hdr.buf, .len_hdr = ba_hdr.len, .ind_msg = ba_msg.buf, .len_msg = ba_msg.len};
+  sm_ag_if_rd_ind_t out = sm->proc.on_indication(sm, &in);
+  assert(out.dapp.ind.e3.type == DAPP_E3_SM_NONE);
+  assert(out.dapp.ind.msg.frmt_1.data_size == sizeof(garbage));
+  sm->alloc.free_ind_data(&out);
+}
+
+/* A control whose E3 payload the xApp serialised itself is encoded as given, not dropped. */
+static void test_ric_control_raw_payload(void)
+{
+  sm_ric_t* sm = make_dapp_sm_ric();
+  defer({ sm->free_sm(sm); });
+
+  uint8_t payload[] = {0x22, 0x02, 0x38, 0x01};
+  dapp_ctrl_req_data_t req = {0};
+  req.hdr.format = FORMAT_1_E2SM_DAPP_CTRL_HDR;
+  req.hdr.frmt_1.ran_function_id = 20;
+  req.hdr.frmt_1.dapp_id = 102;
+  req.msg.format = FORMAT_1_E2SM_DAPP_CTRL_MSG;
+  req.msg.frmt_1.data = payload;
+  req.msg.frmt_1.data_size = sizeof(payload);
+  req.e3.type = DAPP_E3_SM_NONE;
+
+  sm_ctrl_req_data_t out = sm->proc.on_control_req(sm, &req);
+  assert(out.ctrl_hdr != NULL && out.len_hdr > 0);
+  assert(out.ctrl_msg != NULL && out.len_msg > 0);
+
+  e2sm_dapp_ctrl_hdr_t hdr = dapp_dec_ctrl_hdr_asn(out.len_hdr, out.ctrl_hdr);
+  defer({ free_e2sm_dapp_ctrl_hdr(&hdr); });
+  assert(hdr.frmt_1.ran_function_id == 20 && hdr.frmt_1.dapp_id == 102);
+  e2sm_dapp_ctrl_msg_t msg = dapp_dec_ctrl_msg_asn(out.len_msg, out.ctrl_msg);
+  defer({ free_e2sm_dapp_ctrl_msg(&msg); });
+  assert(msg.frmt_1.data_size == sizeof(payload) && memcmp(msg.frmt_1.data, payload, sizeof(payload)) == 0);
+  sm->alloc.free_ctrl_req_data(&out);
+}
+
 int main(void)
 {
   srand((unsigned)time(NULL));
 
   printf("\nDAPP SM enc/dec test launched\n");
+
+  test_ric_indication_unknown_e3_ran_function();
+  test_ric_indication_undecodable_spectrum();
+  test_ric_control_raw_payload();
+  printf("DAPP RIC-side handlers with unknown E3 service models test succeeded\n");
 
   test_dapp_event_trigger();
   printf("DAPP Event Trigger test succeeded\n");

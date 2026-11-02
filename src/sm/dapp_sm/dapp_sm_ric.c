@@ -83,6 +83,11 @@ static sm_subs_data_t on_subscription_dapp_sm_ric(sm_ric_t const* sm_ric, void* 
  *       Extracts the RAN function ID from the header. If the message
  *       carries a non-empty data buffer, calls dapp_dec_e3_indication()
  *       to decode the inner E3 payload into dst.dapp.ind.e3.
+ *       [srs-sharing] Payloads of E3 RAN functions without a decoder here
+ *       (only spectrum has one), or that fail to decode, are kept as raw
+ *       bytes in dst.dapp.ind.msg.frmt_1 with e3.type DAPP_E3_SM_NONE: the
+ *       xApp interprets them. Asserting here would take the RIC or the xApp
+ *       down on any report it does not know.
  *     - Format 2 (subscription map):
  *       The subscription list is already fully decoded by the E2SM-DAPP
  *       message decoder. Sets dst.dapp.ind.e3.type = DAPP_E3_SM_NONE
@@ -113,9 +118,9 @@ static sm_ag_if_rd_ind_t on_indication_dapp_sm_ric(sm_ric_t const* sm_ric, sm_in
     uint32_t ran_function_id = dst.dapp.ind.hdr.frmt_1.ran_function_id;
 
     if (m1->data_size > 0 && m1->data != NULL) {
-      bool ok = dapp_dec_e3_indication(ran_function_id, m1->data, m1->data_size, &dst.dapp.ind.e3);
-      if (!ok) {
-        assert(0 && "Failed to decode inner E3 payload");
+      // [srs-sharing] An unknown E3 RAN function or an undecodable payload leaves e3.type NONE and the raw bytes.
+      if (!dapp_dec_e3_indication(ran_function_id, m1->data, m1->data_size, &dst.dapp.ind.e3)) {
+        dst.dapp.ind.e3.type = DAPP_E3_SM_NONE;
       }
     } else {
       dst.dapp.ind.e3.type = DAPP_E3_SM_NONE;
@@ -149,6 +154,11 @@ static sm_ag_if_rd_ind_t on_indication_dapp_sm_ric(sm_ric_t const* sm_ric, sm_in
  *         using dapp_enc_ctrl_hdr() and dapp_enc_ctrl_msg().
  *      4) Releases the temporary E3 buffer once dapp_enc_ctrl_msg() has
  *         copied its bytes into the outer ControlMessage encoding.
+ *  - [srs-sharing] Otherwise the ControlMessage is sent as given: a control
+ *    whose E3 payload the xApp already serialised (raw bytes in
+ *    tmp.msg.frmt_1.data, e3.type DAPP_E3_SM_NONE) for an E3 service model
+ *    this plugin has no codec for. Header and message were only encoded in
+ *    the case above, so such a control used to leave the E2 node empty.
  *  - Fills a sm_ctrl_req_data_t structure with:
  *      * ctrl_hdr / len_hdr: encoded E2SM-DAPP ControlHeader
  *      * ctrl_msg / len_msg: encoded E2SM-DAPP ControlMessage
@@ -171,10 +181,10 @@ static sm_ctrl_req_data_t ric_on_control_req_dapp_sm_ric(sm_ric_t const* sm_ric,
   sm_ctrl_req_data_t dst = (sm_ctrl_req_data_t){0};
 
   dapp_ctrl_req_data_t tmp = *req;
+  uint8_t* e3_buf = NULL;
 
   if (tmp.e3.type != DAPP_E3_SM_NONE && tmp.msg.format == FORMAT_1_E2SM_DAPP_CTRL_MSG && tmp.msg.frmt_1.data == NULL
       && tmp.msg.frmt_1.data_size == 0) {
-    uint8_t* e3_buf = NULL;
     size_t e3_len = 0;
 
     bool ok = dapp_enc_e3_control(tmp.hdr.frmt_1.ran_function_id, &tmp.e3, &e3_buf, &e3_len);
@@ -185,17 +195,18 @@ static sm_ctrl_req_data_t ric_on_control_req_dapp_sm_ric(sm_ric_t const* sm_ric,
 
     tmp.msg.frmt_1.data = e3_buf;
     tmp.msg.frmt_1.data_size = (uint32_t)e3_len;
-
-    byte_array_t ba_hdr = dapp_enc_ctrl_hdr(&sm->enc, &tmp.hdr);
-    dst.ctrl_hdr = ba_hdr.buf;
-    dst.len_hdr = ba_hdr.len;
-
-    byte_array_t ba_msg = dapp_enc_ctrl_msg(&sm->enc, &tmp.msg);
-    dst.ctrl_msg = ba_msg.buf;
-    dst.len_msg = ba_msg.len;
-
-    free(e3_buf);
   }
+
+  // [srs-sharing] Encode in both cases: a payload encoded above, or raw bytes the xApp already put in the message.
+  byte_array_t ba_hdr = dapp_enc_ctrl_hdr(&sm->enc, &tmp.hdr);
+  dst.ctrl_hdr = ba_hdr.buf;
+  dst.len_hdr = ba_hdr.len;
+
+  byte_array_t ba_msg = dapp_enc_ctrl_msg(&sm->enc, &tmp.msg);
+  dst.ctrl_msg = ba_msg.buf;
+  dst.len_msg = ba_msg.len;
+
+  free(e3_buf);
 
   return dst;
 }
