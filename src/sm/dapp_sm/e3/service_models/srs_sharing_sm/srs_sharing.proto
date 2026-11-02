@@ -99,6 +99,19 @@ message SrsResource {
   GroupOrSequenceHopping group_or_sequence_hopping = 8;  // groupOrSequenceHopping
   PeriodicityAndOffset periodicity_and_offset = 9;       // resourceType periodic: periodicityAndOffset-p
   uint32 sequence_id = 10;                        // sequenceId, 0..1023
+  SrsDerivedMapping derived = 11;                 // TS 38.211 values, when the serving gNB knows them
+}
+
+// TS 38.211 6.4.1.4 values that follow from the resource and its BWP, as the serving gNB computes them (OCUDU's
+// srs.config stream exports them). They save a receiver the 38.211 tables, and the receiver's blind (u, v) search
+// checks them. Absent with group, sequence or frequency hopping, where they change from occasion to occasion.
+message SrsDerivedMapping {
+  uint32 start_symbol = 1;          // l0: first SRS symbol in the slot
+  uint32 initial_subcarrier = 2;    // k0: first comb tooth, subcarrier within the BWP
+  uint32 sequence_length = 3;       // M_sc,b^SRS
+  uint32 sequence_group = 4;        // u
+  uint32 sequence_number = 5;       // v
+  uint32 cyclic_shift_maximum = 6;  // n_SRS^cs,max
 }
 
 message TransmissionComb {
