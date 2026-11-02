@@ -446,7 +446,8 @@ sm_ans_xapp_t report_sm_sync_xapp(e42_xapp_t* xapp, global_e2_node_id_t* id, uin
   // Generate and registry the ric_req_id
   ric_gen_id_t ric_id = generate_ric_gen_id(xapp, RIC_SUBSCRIPTION_PROCEDURE_ACTIVE , rf_id, id, cb);
 
-  // Send message 
+  // Send message ([srs-sharing] armed first, so that an early answer is not lost)
+  arm_sync_ui(&xapp->sync);
   send_subscription_request(xapp, id, ric_id, data);
 
   // Wait for the answer (it will arrive in the event loop)
@@ -489,7 +490,8 @@ void rm_report_sm_sync_xapp(e42_xapp_t* xapp, int ric_req_id)
     exit(-1);
   }
 
-  // Send message
+  // Send message ([srs-sharing] armed first, so that an early answer is not lost)
+  arm_sync_ui(&xapp->sync);
   send_ric_subscription_delete(xapp, ans.val.id);
 
   // Wait for the answer (it will arrive in the event loop)
@@ -538,7 +540,8 @@ sm_ans_xapp_t control_sm_sync_xapp(e42_xapp_t* xapp, global_e2_node_id_t* id, ui
   // Generate and registry the ric_req_id
   ric_gen_id_t ric_id = generate_ric_gen_id(xapp, RIC_CONTROL_PROCEDURE_ACTIVE, ran_func_id, id, NULL);
 
-  // Send the message
+  // Send the message ([srs-sharing] armed first, so that an early answer is not lost)
+  arm_sync_ui(&xapp->sync);
   send_control_request(xapp, id, ric_id, ctrl_msg);  
 
   // Wait for the answer (it will arrive in the event loop)

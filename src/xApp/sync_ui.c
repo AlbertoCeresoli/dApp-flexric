@@ -61,6 +61,14 @@ void free_sync_ui(sync_ui_t* s)
   assert(rc == 0);
 }
 
+void arm_sync_ui(sync_ui_t* s)
+{
+  assert(s != NULL);
+  lock_guard(&s->mtx_sync);
+  s->flag_sync = false;
+  s->msg_ack = false;
+}
+
 void cond_wait_sync_ui(sync_ui_t* s, uint32_t wait_ms)
 {
   assert(s != NULL);
@@ -68,8 +76,8 @@ void cond_wait_sync_ui(sync_ui_t* s, uint32_t wait_ms)
 
   pthread_mutex_lock(&s->mtx_sync);
 
-  s->flag_sync = false;
-  s->msg_ack = false;
+  // [srs-sharing] The flags are reset by arm_sync_ui() before the request is sent, no longer here: resetting them
+  // here dropped an answer that had already arrived.
   struct timespec ts = {0};
   int rc = clock_gettime(CLOCK_REALTIME, &ts);
   assert(rc == 0);

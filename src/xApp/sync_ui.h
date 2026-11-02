@@ -39,6 +39,10 @@ void init_sync_ui(sync_ui_t* s);
 
 void free_sync_ui(sync_ui_t* s);
 
+// [srs-sharing] Call before sending the request whose answer cond_wait_sync_ui then waits for: an answer that
+// arrives before the wait starts is kept instead of being lost (which made the wait run to its timeout).
+void arm_sync_ui(sync_ui_t* s);
+
 void cond_wait_sync_ui(sync_ui_t* s, uint32_t ms);
 
 void signal_sync_ui(sync_ui_t* s); 

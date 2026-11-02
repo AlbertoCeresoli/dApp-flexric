@@ -577,14 +577,16 @@ e2ap_msg_t e2ap_handle_e42_subscription_delete_request_xapp(e42_xapp_t* xapp, co
   byte_array_t ba_msg = e2ap_enc_e42_ric_subscription_delete_xapp(&xapp->ap,( e42_ric_subscription_delete_request_t* ) e42_sdr);
   defer({ free_byte_array(ba_msg) ;}; );
 
-  e2ap_send_bytes_xapp(&xapp->ep, ba_msg);
-
   // A pending event is created along with a timer of 10000 ms,
-  // after which an event will be generated
+  // after which an event will be generated.
+  // [srs-sharing] Registered before sending, as for subscription requests: a fast answer must find it (see the
+  // control request below).
   pending_event_xapp_t ev = {.ev = E42_RIC_SUBSCRIPTION_DELETE_REQUEST_PENDING_EVENT, 
                               .id = e42_sdr->sdr.ric_id,
                               .wait_ms = 10000};
   add_pending_event_xapp(xapp, &ev);
+
+  e2ap_send_bytes_xapp(&xapp->ep, ba_msg);
 
 
   e2ap_msg_t ans = {.type = NONE_E2_MSG_TYPE};
@@ -602,14 +604,18 @@ e2ap_msg_t e2ap_handle_e42_ric_control_request_xapp(e42_xapp_t* xapp, const e2ap
   byte_array_t ba_msg = e2ap_enc_e42_control_request_xapp(&xapp->ap,(  e42_ric_control_request_t* ) cr);
   defer({ free_byte_array(ba_msg) ;}; );
 
-  e2ap_send_bytes_xapp(&xapp->ep, ba_msg);
-
-  printf("[xApp]: CONTROL-REQUEST tx \n");
-
+  // [srs-sharing] Register the pending event before sending, as for subscription requests. The answer is handled
+  // on the event-loop thread and removes this event: sent first, a fast answer (an E2 node on loopback acknowledges
+  // within a millisecond) could find no event to remove, which crashes in the registry when asserts are compiled
+  // out (Release).
   pending_event_xapp_t ev = {.ev = E42_RIC_CONTROL_REQUEST_PENDING_EVENT,
     .id = cr->ctrl_req.ric_id,
     .wait_ms = 10000};
   add_pending_event_xapp(xapp, &ev);
+
+  e2ap_send_bytes_xapp(&xapp->ep, ba_msg);
+
+  printf("[xApp]: CONTROL-REQUEST tx \n");
 
 
   e2ap_msg_t ans = {.type = NONE_E2_MSG_TYPE};
