@@ -9,7 +9,9 @@
 // E2SM-DAPP has no sequence identifier, so correlation (Header.sequence) is carried here.
 //
 // Roles are symmetric: any gNB's dApp can report its own UEs (SrsConfigReport, TimingAdvanceIndicationMessage)
-// and receive other gNBs' UEs (ForeignUeUpdate). Every UE is therefore named with its serving gNB (UeRef).
+// and receive other gNBs' UEs (ForeignUeUpdate). Every UE is therefore named with its serving gNB (UeRef). The two
+// roles may be one dApp or two; a dApp that wants foreign UEs says so with ReceiverHello, and the xApp sends
+// ForeignUeUpdates only to dApps that did.
 //
 // Naming. SRS fields use the TS 38.331 SRS-Resource field names in snake_case (srs-ResourceId ->
 // srs_resource_id, transmissionComb -> transmission_comb, ...). Timing advance messages reuse the names of the
@@ -52,6 +54,7 @@ message SrsSharingMessage {
     SrsConfigReport srs_config_report = 2;                       // dApp -> xApp
     TimingAdvanceIndicationMessage timing_advance_indication = 3; // dApp -> xApp
     ForeignUeUpdate foreign_ue_update = 4;                        // xApp -> dApp
+    ReceiverHello receiver_hello = 5;                             // dApp -> xApp
   }
 }
 
@@ -192,6 +195,18 @@ message TimingAdvanceData {
 
 message TimingAdvanceIndicationMessage {
   repeated TimingAdvanceData timing_advance_data = 1;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// dApp -> xApp: a dApp that receives foreign UEs
+// ---------------------------------------------------------------------------------------------------------------
+
+// Sent by a receiving dApp when it starts and then every resend_interval_s. The xApp sends ForeignUeUpdates only to
+// dApps that announced themselves, sends a newly announced dApp the current state of every foreign UE at once, and
+// forgets a dApp that leaves its gNB's dApp map or stays silent for three intervals.
+message ReceiverHello {
+  CellRef cell = 1;               // the gNB and cell the dApp receives on
+  uint32 resend_interval_s = 2;   // how often the hello is repeated
 }
 
 // ---------------------------------------------------------------------------------------------------------------

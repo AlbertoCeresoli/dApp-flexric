@@ -1,15 +1,25 @@
 /*
- * [srs-sharing] SRS sharing xApp: relays the UEs one gNB's dApp reports to the dApps of the other gNBs, so that they
- * can receive those UEs' SRS.
+ * [srs-sharing] SRS sharing xApp: relays the UEs one gNB's dApp reports to the receiving dApps of the other gNBs, so
+ * that they can receive those UEs' SRS.
  *
  * Over E2SM-DAPP (SM ID 255) on every E2 node that offers it:
- *  - report style 1 (E3 data): payloads on E3 RAN function RAN_FUNCTION_SRS_SHARING (20) are SrsSharingMessages
- *    from reporting dApps (SrsConfigReport, TimingAdvanceIndicationMessage); other E3 RAN functions are ignored;
+ *  - report style 1 (E3 data): payloads on E3 RAN function RAN_FUNCTION_SRS_SHARING (20) are SrsSharingMessages from
+ *    dApps: SrsConfigReport and TimingAdvanceIndicationMessage from reporting dApps, ReceiverHello from receiving
+ *    dApps; other E3 RAN functions are ignored;
  *  - report style 2 (subscription map): which dApps are connected to each node;
- *  - control style 1: each resulting ForeignUeUpdate goes, as an E3 xApp control on RAN function 20, to every dApp
- *    connected to every node other than the reporting one. A dApp that does not take part ignores the control.
- *    A dApp that appears in a map gets the current state of every known UE at once.
+ *  - control style 1: each resulting ForeignUeUpdate goes, as an E3 xApp control on RAN function 20, to every
+ *    receiving dApp of every node other than the reporting one.
+ * A receiving dApp is one that sent a ReceiverHello: it gets the current state of every foreign UE when it first
+ * announces itself, and is forgotten when it leaves its node's dApp map or misses three hellos. The roles may be
+ * separate dApps or one; only a dApp's hellos make it a receiver.
  * The registry (srs_sharing_registry.c) keeps the UEs and their timing advance ledger and builds the updates.
+ *
+ * Output: one timestamped checkpoint line per lifecycle event, in the format of the dApps (dapp/srs_sharing/
+ * checkpoints.py), tag [srs-xapp]: start, each node subscribed, each receiver announced or gone, each UE's new
+ * configuration, timing advance change and release with how many receivers acknowledged it, and every failed
+ * control. Updates that only refresh a UE's slot anchor are counted in an "alive" line every 30 s.
+ * SRS_XAPP_VERBOSE=1 prints every update and control, SRS_XAPP_QUIET=1 errors only. FlexRIC's own lines
+ * ("[xApp]: ...") are printed by its library, not by this file.
  *
  * Threads: the indication callbacks run on FlexRIC's threads and only queue work; the main loop drains the queue,
  * sends the controls (control_sm_xapp_api blocks until the node answers) and every two seconds looks for new E2
@@ -29,9 +39,11 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,7 +54,9 @@ static uint32_t const STYLE_SUBSCRIPTION_MAP = 2;
 
 #define MAX_NODES 16
 #define MAX_DAPPS 64
+#define MAX_RECEIVERS 64
 #define MAX_UPDATES 64
+#define MAX_TRACKED_UES 256
 
 static volatile sig_atomic_t g_terminate = 0;
 
@@ -60,6 +74,51 @@ static uint64_t monotonic_us(void)
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
+
+/* ---- checkpoint output ------------------------------------------------------------------------------------- */
+
+static bool g_verbose = false;
+static bool g_quiet = false;
+static pthread_mutex_t g_print_mtx = PTHREAD_MUTEX_INITIALIZER; /* callbacks print too */
+
+static void vlog_line(FILE* out, char const* fmt, va_list ap)
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  struct tm tm;
+  localtime_r(&tv.tv_sec, &tm);
+  pthread_mutex_lock(&g_print_mtx);
+  fprintf(out, "%02d:%02d:%02d.%03ld [srs-xapp] ", tm.tm_hour, tm.tm_min, tm.tm_sec, (long)(tv.tv_usec / 1000));
+  vfprintf(out, fmt, ap);
+  fputc('\n', out);
+  fflush(out);
+  pthread_mutex_unlock(&g_print_mtx);
+}
+
+/* A checkpoint: printed unless quiet. */
+static void say(char const* fmt, ...)
+{
+  if (g_quiet)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vlog_line(stdout, fmt, ap);
+  va_end(ap);
+}
+
+/* Always printed. */
+static void error_line(char const* fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  vlog_line(stderr, fmt, ap);
+  va_end(ap);
+}
+
+/* Counts since the last alive line, and since the start. */
+static struct {
+  uint64_t messages, refreshes, controls_ok, controls_failed;
+} g_window, g_total;
 
 /* ---- E2 node identity -------------------------------------------------------------------------------------
  * Indication headers name their node with TS 38.413 PLMN octets (BCD: MCC2|MCC1, MNC3|MCC3, MNC2|MNC1, MNC3 = F
@@ -89,6 +148,18 @@ static node_key_t key_from_node(global_e2_node_id_t const* id)
                       .nb_id = id->nb_id.nb_id};
 }
 
+static bool same_node(node_key_t a, node_key_t b)
+{
+  return a.mcc == b.mcc && a.mnc == b.mnc && a.nb_id == b.nb_id;
+}
+
+/* "001-01/411": how nodes are named in the output. */
+static char const* node_name(node_key_t k, char* buf, size_t len)
+{
+  snprintf(buf, len, "%03u-%0*u/%u", k.mcc, k.mnc_len == 3 ? 3 : 2, k.mnc, k.nb_id);
+  return buf;
+}
+
 /* Whether a UE (its serving cell, as SrsSharingMessages name it: PLMN digits and gNB ID) is served by this node. Both
  * parts are needed: different operators can use the same gNB ID (the two lab gNBs both use OCUDU's default, 411). */
 static bool serves(node_key_t key, SrsSharing__V1__CellRef const* cell)
@@ -97,11 +168,6 @@ static bool serves(node_key_t key, SrsSharing__V1__CellRef const* cell)
   snprintf(plmn, sizeof(plmn), "%03u%0*u", key.mcc, key.mnc_len == 3 ? 3 : 2, key.mnc);
   return cell != NULL && cell->plmn_identity != NULL && strcmp(cell->plmn_identity, plmn) == 0
          && cell->gnb_id == key.nb_id;
-}
-
-static bool same_node(node_key_t a, node_key_t b)
-{
-  return a.mcc == b.mcc && a.mnc == b.mnc && a.nb_id == b.nb_id;
 }
 
 /* ---- state shared with the callbacks (all under g_mtx) -------------------------------------------------- */
@@ -117,9 +183,6 @@ typedef struct {
   node_key_t key;
   uint32_t dapps[MAX_DAPPS];
   size_t nof_dapps;
-  bool known;              /* a map has arrived */
-  uint32_t fresh[MAX_DAPPS];  /* dApps new in the latest map: they get a snapshot */
-  size_t nof_fresh;
 } dapp_map_t;
 
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -139,6 +202,17 @@ static dapp_map_t* map_of(node_key_t key)
   memset(m, 0, sizeof(*m));
   m->key = key;
   return m;
+}
+
+/* Whether dApp dapp_id is in node's latest map. Call with g_mtx held. */
+static bool in_map(node_key_t node, uint32_t dapp_id)
+{
+  for (size_t i = 0; i < g_nof_maps; ++i)
+    if (same_node(g_maps[i].key, node))
+      for (size_t j = 0; j < g_maps[i].nof_dapps; ++j)
+        if (g_maps[i].dapps[j] == dapp_id)
+          return true;
+  return false;
 }
 
 /* Report style 1: queue SRS sharing payloads; ignore every other E3 RAN function. */
@@ -171,7 +245,7 @@ static void on_e3_data(sm_ag_if_rd_t const* rd)
   pthread_mutex_unlock(&g_mtx);
 }
 
-/* Report style 2: replace the node's dApp list, and remember which dApps are new. */
+/* Report style 2: replace the node's dApp list (receivers that left are dropped by the main loop). */
 static void on_subscription_map(sm_ag_if_rd_t const* rd)
 {
   assert(rd != NULL && rd->type == INDICATION_MSG_AGENT_IF_ANS_V0);
@@ -185,21 +259,9 @@ static void on_subscription_map(sm_ag_if_rd_t const* rd)
   pthread_mutex_lock(&g_mtx);
   dapp_map_t* m = map_of(key);
   if (m != NULL) {
-    uint32_t old[MAX_DAPPS];
-    size_t nof_old = m->nof_dapps;
-    memcpy(old, m->dapps, sizeof(old));
     m->nof_dapps = 0;
-    for (size_t i = 0; i < list->sz_dapp_e3_subscriptions && m->nof_dapps < MAX_DAPPS; ++i) {
-      uint32_t id = list->dapp_e3_subscriptions[i].dapp_id;
-      m->dapps[m->nof_dapps++] = id;
-      bool seen = false;
-      for (size_t j = 0; j < nof_old; ++j)
-        seen = seen || old[j] == id;
-      if (!seen && m->nof_fresh < MAX_DAPPS)
-        m->fresh[m->nof_fresh++] = id;
-    }
-    m->known = true;
-    printf("[SRS xApp] node %03u-%02u/%u: %zu dApp(s) connected\n", key.mcc, key.mnc, key.nb_id, m->nof_dapps);
+    for (size_t i = 0; i < list->sz_dapp_e3_subscriptions && m->nof_dapps < MAX_DAPPS; ++i)
+      m->dapps[m->nof_dapps++] = list->dapp_e3_subscriptions[i].dapp_id;
   }
   pthread_mutex_unlock(&g_mtx);
 }
@@ -250,18 +312,19 @@ static void add_new_nodes(void)
       known = known || same_node(g_nodes[j].key, key);
     if (known || !offers_dapp(n) || g_nof_nodes == MAX_NODES)
       continue;
+    char name[32];
     node_t* node = &g_nodes[g_nof_nodes];
     node->id = cp_global_e2_node_id(&n->id);
     node->key = key;
     node->e3_data = subscribe(&node->id, STYLE_E3_DATA, on_e3_data);
     node->map = subscribe(&node->id, STYLE_SUBSCRIPTION_MAP, on_subscription_map);
     if (!node->e3_data.success || !node->map.success) {
-      printf("[SRS xApp] node %03u-%02u/%u: subscription failed\n", key.mcc, key.mnc, key.nb_id);
+      error_line("node %s: E2SM-DAPP subscription failed", node_name(key, name, sizeof(name)));
       free_global_e2_node_id(&node->id);
       continue;
     }
     g_nof_nodes++;
-    printf("[SRS xApp] node %03u-%02u/%u: subscribed to E3 data and the dApp map\n", key.mcc, key.mnc, key.nb_id);
+    say("node %s: subscribed to its dApps' reports and dApp map", node_name(key, name, sizeof(name)));
   }
 }
 
@@ -273,12 +336,164 @@ static node_t* node_of(node_key_t key)
   return NULL;
 }
 
+/* ---- receivers (main thread only) --------------------------------------------------------------------------- */
+
+typedef struct {
+  node_key_t node;
+  uint32_t dapp_id;
+  uint64_t last_hello_us;
+  uint32_t interval_s;
+} receiver_t;
+
+static receiver_t g_receivers[MAX_RECEIVERS];
+static size_t g_nof_receivers = 0;
+
+/* Registers or refreshes a receiver; returns true when it is new. */
+static bool on_hello(srs_source_t src, SrsSharing__V1__ReceiverHello const* hello)
+{
+  node_key_t node = key_from_header(src.plmn, src.nb_id);
+  for (size_t i = 0; i < g_nof_receivers; ++i)
+    if (same_node(g_receivers[i].node, node) && g_receivers[i].dapp_id == src.dapp_id) {
+      g_receivers[i].last_hello_us = monotonic_us();
+      g_receivers[i].interval_s = hello->resend_interval_s;
+      return false;
+    }
+  if (g_nof_receivers == MAX_RECEIVERS) {
+    error_line("too many receivers: dApp %u ignored", src.dapp_id);
+    return false;
+  }
+  g_receivers[g_nof_receivers++] = (receiver_t){
+      .node = node, .dapp_id = src.dapp_id, .last_hello_us = monotonic_us(), .interval_s = hello->resend_interval_s};
+  char name[32];
+  SrsSharing__V1__CellRef const* c = hello->cell;
+  say("receiver dApp %u on node %s announced (cell %s/%" PRIu64 "/%u, hello every %u s)", src.dapp_id,
+      node_name(node, name, sizeof(name)), c != NULL && c->plmn_identity != NULL ? c->plmn_identity : "?",
+      c != NULL ? c->gnb_id : 0, c != NULL ? c->phys_cell_id : 0, hello->resend_interval_s);
+  return true;
+}
+
+/* Drops receivers that left their node's dApp map or missed three hellos. */
+static void expire_receivers(void)
+{
+  uint64_t const now = monotonic_us();
+  for (size_t i = 0; i < g_nof_receivers;) {
+    receiver_t const* r = &g_receivers[i];
+    pthread_mutex_lock(&g_mtx);
+    bool const present = in_map(r->node, r->dapp_id);
+    pthread_mutex_unlock(&g_mtx);
+    uint64_t const limit = 3ull * (r->interval_s > 0 ? r->interval_s : 30) * 1000000ull;
+    bool const silent = now - r->last_hello_us > limit;
+    /* A receiver may announce itself before the next map lists it: it only counts as gone when it is still
+     * missing from the map a few seconds after its last hello. */
+    bool const gone = !present && now - r->last_hello_us > 5000000;
+    if (gone || silent) {
+      char name[32];
+      say("receiver dApp %u on node %s %s", r->dapp_id, node_name(r->node, name, sizeof(name)),
+          silent ? "stopped sending hellos: forgotten" : "left its gNB: forgotten");
+      g_receivers[i] = g_receivers[--g_nof_receivers];
+      continue;
+    }
+    ++i;
+  }
+}
+
+/* ---- per-UE view, to tell lifecycle events from routine refreshes ------------------------------------------ */
+
+typedef struct {
+  char plmn[8];
+  uint64_t gnb_id;
+  uint32_t pci, rnti;
+  uint64_t epoch;
+  bool has_ta, suspect, anchored;
+  int64_t n_ta;
+} ue_view_t;
+
+static ue_view_t g_ues[MAX_TRACKED_UES];
+static size_t g_nof_ues = 0;
+
+typedef enum { UE_NEW, UE_NEW_EPOCH, UE_TA, UE_FIRST_ANCHOR, UE_REFRESH, UE_RELEASED } ue_event_t;
+
+static char const* event_text(ue_event_t e)
+{
+  switch (e) {
+    case UE_NEW:
+      return "new";
+    case UE_NEW_EPOCH:
+      return "new configuration";
+    case UE_TA:
+      return "timing advance";
+    case UE_FIRST_ANCHOR:
+      return "first slot anchor";
+    case UE_REFRESH:
+      return "anchor refresh";
+    case UE_RELEASED:
+      return "released";
+  }
+  return "?";
+}
+
+/* Compares an update with the previous one for the same UE. */
+static ue_event_t classify(SrsSharing__V1__ForeignUeUpdate const* f)
+{
+  SrsSharing__V1__CellRef const* c = f->ue->serving_cell;
+  ue_view_t* v = NULL;
+  for (size_t i = 0; i < g_nof_ues && v == NULL; ++i)
+    if (strcmp(g_ues[i].plmn, c->plmn_identity) == 0 && g_ues[i].gnb_id == c->gnb_id
+        && g_ues[i].pci == c->phys_cell_id && g_ues[i].rnti == f->ue->rnti)
+      v = &g_ues[i];
+  if (f->released) {
+    if (v != NULL)
+      *v = g_ues[--g_nof_ues];
+    return UE_RELEASED;
+  }
+  ue_view_t now = {.gnb_id = c->gnb_id, .pci = c->phys_cell_id, .rnti = f->ue->rnti, .epoch = f->config_epoch,
+                   .has_ta = f->timing_advance != NULL, .anchored = f->anchor != NULL};
+  strncpy(now.plmn, c->plmn_identity, sizeof(now.plmn) - 1);
+  if (f->timing_advance != NULL) {
+    now.n_ta = f->timing_advance->n_ta_steps;
+    now.suspect = f->timing_advance->missed_command_suspected;
+  }
+  ue_event_t e;
+  if (v == NULL) {
+    e = UE_NEW;
+    if (g_nof_ues < MAX_TRACKED_UES)
+      v = &g_ues[g_nof_ues++];
+  } else if (v->epoch != now.epoch) {
+    e = UE_NEW_EPOCH;
+  } else if (v->has_ta != now.has_ta || v->n_ta != now.n_ta || v->suspect != now.suspect) {
+    e = UE_TA;
+  } else if (!v->anchored && now.anchored) {
+    e = UE_FIRST_ANCHOR;
+  } else {
+    e = UE_REFRESH;
+  }
+  if (v != NULL)
+    *v = now;
+  return e;
+}
+
+/* "UE 00101/411/1 0x4601 epoch 2 new: period 20 offset 7, anchor 227.7, N_TA 17 steps (1 commands)" */
+static void ue_text(SrsSharing__V1__ForeignUeUpdate const* f, ue_event_t e, char* buf, size_t len)
+{
+  SrsSharing__V1__CellRef const* c = f->ue->serving_cell;
+  int n = snprintf(buf, len, "UE %s/%" PRIu64 "/%u 0x%04x epoch %" PRIu64 " %s", c->plmn_identity, c->gnb_id,
+                   c->phys_cell_id, f->ue->rnti, f->config_epoch, event_text(e));
+  if (e == UE_RELEASED || n < 0 || (size_t)n >= len)
+    return;
+  if ((e == UE_NEW || e == UE_NEW_EPOCH) && f->resource != NULL && f->resource->periodicity_and_offset != NULL)
+    n += snprintf(buf + n, len - n, ": period %u offset %u", f->resource->periodicity_and_offset->period,
+                  f->resource->periodicity_and_offset->offset);
+  if (f->anchor != NULL && (size_t)n < len)
+    n += snprintf(buf + n, len - n, ", anchor %u.%u", f->anchor->sfn, f->anchor->slot);
+  if (f->timing_advance != NULL && (size_t)n < len)
+    snprintf(buf + n, len - n, ", N_TA %" PRId64 " steps (%u commands%s)", f->timing_advance->n_ta_steps,
+             f->timing_advance->nof_commands,
+             f->timing_advance->missed_command_suspected ? ", missed command suspected" : "");
+}
+
 /* ---- sending ----------------------------------------------------------------------------------------- */
 
-static uint64_t g_controls_ok = 0;
-static uint64_t g_controls_failed = 0;
-
-static void send_control(node_t* node, uint32_t dapp_id, srs_packed_t const* p)
+static bool send_control(node_t* node, uint32_t dapp_id, srs_packed_t const* p)
 {
   dapp_ctrl_req_data_t ctrl = {0};
   ctrl.hdr.format = FORMAT_1_E2SM_DAPP_CTRL_HDR;
@@ -290,109 +505,74 @@ static void send_control(node_t* node, uint32_t dapp_id, srs_packed_t const* p)
   ctrl.msg.frmt_1.data_size = (uint32_t)p->len;
   ctrl.e3.type = DAPP_E3_SM_NONE;
   sm_ans_xapp_t ans = control_sm_xapp_api(&node->id, DAPP_SM_ID, &ctrl);
-  if (ans.success)
-    g_controls_ok++;
-  else
-    g_controls_failed++;
-  printf("[SRS xApp]   -> node %03u-%02u/%u dApp %u: %s\n", node->key.mcc, node->key.mnc, node->key.nb_id, dapp_id,
-         ans.success ? "ack" : "failure");
+  char name[32];
+  if (ans.success) {
+    g_window.controls_ok++;
+    g_total.controls_ok++;
+    if (g_verbose)
+      say("  -> node %s dApp %u: ack", node_name(node->key, name, sizeof(name)), dapp_id);
+  } else {
+    g_window.controls_failed++;
+    g_total.controls_failed++;
+    error_line("control to dApp %u on node %s failed", dapp_id, node_name(node->key, name, sizeof(name)));
+  }
+  return ans.success;
 }
 
-/* One recipient: a dApp on a node other than the reporter's. */
-typedef struct {
-  node_key_t node;
-  uint32_t dapp_id;
-} target_t;
-
-static size_t targets_except(node_key_t source, target_t* out, size_t max_out)
-{
-  size_t n = 0;
-  pthread_mutex_lock(&g_mtx);
-  for (size_t i = 0; i < g_nof_maps; ++i)
-    if (!same_node(g_maps[i].key, source))
-      for (size_t j = 0; j < g_maps[i].nof_dapps && n < max_out; ++j)
-        out[n++] = (target_t){.node = g_maps[i].key, .dapp_id = g_maps[i].dapps[j]};
-  pthread_mutex_unlock(&g_mtx);
-  return n;
-}
-
-static void describe(srs_packed_t const* p)
+/* Sends one update to every receiver outside the source node, or only to receiver `only` when it is >= 0 (snapshot),
+ * and prints its checkpoint. */
+static void send_update(srs_packed_t const* p, node_key_t source, long only)
 {
   SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, p->len, p->buf);
-  if (m == NULL || m->foreign_ue_update == NULL)
+  if (m == NULL || m->foreign_ue_update == NULL) {
+    if (m != NULL)
+      srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
     return;
-  SrsSharing__V1__ForeignUeUpdate const* f = m->foreign_ue_update;
-  SrsSharing__V1__CellRef const* c = f->ue->serving_cell;
-  printf("[SRS xApp] ForeignUeUpdate #%" PRIu64 ": UE %s/%" PRIu64 "/PCI %u rnti 0x%04x epoch %" PRIu64,
-         m->header->sequence, c->plmn_identity, c->gnb_id, c->phys_cell_id, f->ue->rnti, f->config_epoch);
-  if (f->released)
-    printf(" released");
-  if (f->resource != NULL && f->resource->periodicity_and_offset != NULL)
-    printf(" period %u offset %u", f->resource->periodicity_and_offset->period,
-           f->resource->periodicity_and_offset->offset);
-  if (f->anchor != NULL)
-    printf(" anchor %u.%u", f->anchor->sfn, f->anchor->slot);
-  if (f->timing_advance != NULL)
-    printf(" N_TA %" PRId64 " steps (%u commands%s)", f->timing_advance->n_ta_steps, f->timing_advance->nof_commands,
-           f->timing_advance->missed_command_suspected ? ", missed command suspected" : "");
-  printf("\n");
+  }
+  ue_event_t e = only >= 0 ? UE_NEW : classify(m->foreign_ue_update);
+  size_t targets = 0, acked = 0;
+  for (size_t i = 0; i < g_nof_receivers; ++i) {
+    if (only >= 0 ? (size_t)only != i : same_node(g_receivers[i].node, source))
+      continue;
+    node_t* node = node_of(g_receivers[i].node);
+    if (node == NULL)
+      continue;
+    targets++;
+    acked += send_control(node, g_receivers[i].dapp_id, p);
+  }
+  char text[256];
+  ue_text(m->foreign_ue_update, e, text, sizeof(text));
+  if (e == UE_REFRESH && !g_verbose) {
+    g_window.refreshes++;
+    g_total.refreshes++;
+  } else if (targets == 0) {
+    say("%s -> no receiver on another gNB yet", text);
+  } else {
+    say("%s%s -> %zu/%zu receiver(s) acked", text, only >= 0 ? " (snapshot)" : "", acked, targets);
+  }
   srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
 }
 
-static void deliver(srs_packed_t* updates, size_t n, node_key_t source)
+/* A new receiver gets every known UE not served by its own node. */
+static void send_snapshot(srs_registry_t* reg, size_t receiver)
 {
-  target_t targets[MAX_NODES * MAX_DAPPS];
-  size_t nof_targets = targets_except(source, targets, MAX_NODES * MAX_DAPPS);
+  srs_packed_t updates[MAX_UPDATES];
+  size_t n = srs_registry_snapshot(reg, monotonic_us(), updates, MAX_UPDATES);
+  size_t sent = 0;
   for (size_t i = 0; i < n; ++i) {
-    describe(&updates[i]);
-    if (nof_targets == 0)
-      printf("[SRS xApp]   no dApp on another node to send it to\n");
-    for (size_t t = 0; t < nof_targets; ++t) {
-      node_t* node = node_of(targets[t].node);
-      if (node != NULL)
-        send_control(node, targets[t].dapp_id, &updates[i]);
+    SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, updates[i].len,
+                                                                                       updates[i].buf);
+    bool const own = m != NULL && serves(g_receivers[receiver].node, m->foreign_ue_update->ue->serving_cell);
+    if (m != NULL)
+      srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
+    if (!own) {
+      send_update(&updates[i], (node_key_t){0}, (long)receiver);
+      sent++;
     }
     free(updates[i].buf);
   }
-}
-
-/* New dApps get every known UE, except those their own node serves. */
-static void send_snapshots(srs_registry_t* reg)
-{
-  for (;;) {
-    node_key_t node_key;
-    uint32_t dapp_id;
-    bool found = false;
-    pthread_mutex_lock(&g_mtx);
-    for (size_t i = 0; i < g_nof_maps && !found; ++i)
-      if (g_maps[i].nof_fresh > 0) {
-        node_key = g_maps[i].key;
-        dapp_id = g_maps[i].fresh[--g_maps[i].nof_fresh];
-        found = true;
-      }
-    pthread_mutex_unlock(&g_mtx);
-    if (!found)
-      return;
-    node_t* node = node_of(node_key);
-    if (node == NULL)
-      continue;
-    srs_packed_t updates[MAX_UPDATES];
-    size_t n = srs_registry_snapshot(reg, monotonic_us(), updates, MAX_UPDATES);
-    for (size_t i = 0; i < n; ++i) {
-      SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, updates[i].len,
-                                                                                         updates[i].buf);
-      bool own = m != NULL && serves(node_key, m->foreign_ue_update->ue->serving_cell);
-      if (m != NULL)
-        srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
-      if (!own) {
-        printf("[SRS xApp] snapshot for new dApp %u on node %03u-%02u/%u\n", dapp_id, node_key.mcc, node_key.mnc,
-               node_key.nb_id);
-        describe(&updates[i]);
-        send_control(node, dapp_id, &updates[i]);
-      }
-      free(updates[i].buf);
-    }
-  }
+  if (sent == 0)
+    say("  no foreign UE known yet for it");
 }
 
 static void drain(srs_registry_t* reg)
@@ -402,9 +582,24 @@ static void drain(srs_registry_t* reg)
   g_head = g_tail = NULL;
   pthread_mutex_unlock(&g_mtx);
   while (w != NULL) {
-    srs_packed_t updates[MAX_UPDATES];
-    size_t n = srs_registry_on_payload(reg, w->src, w->data, w->len, monotonic_us(), updates, MAX_UPDATES);
-    deliver(updates, n, key_from_header(w->src.plmn, w->src.nb_id));
+    g_window.messages++;
+    g_total.messages++;
+    node_key_t const source = key_from_header(w->src.plmn, w->src.nb_id);
+    /* Hellos are about receivers, not UEs: the xApp keeps them; everything else goes to the registry. */
+    SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, w->len, w->data);
+    if (m != NULL && m->body_case == SRS_SHARING__V1__SRS_SHARING_MESSAGE__BODY_RECEIVER_HELLO) {
+      if (on_hello(w->src, m->receiver_hello))
+        send_snapshot(reg, g_nof_receivers - 1);
+    } else {
+      srs_packed_t updates[MAX_UPDATES];
+      size_t n = srs_registry_on_payload(reg, w->src, w->data, w->len, monotonic_us(), updates, MAX_UPDATES);
+      for (size_t i = 0; i < n; ++i) {
+        send_update(&updates[i], source, -1);
+        free(updates[i].buf);
+      }
+    }
+    if (m != NULL)
+      srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
     work_t* next = w->next;
     free(w->data);
     free(w);
@@ -426,6 +621,12 @@ static void discard_queue(void)
   }
 }
 
+static double env_number(char const* name, double fallback)
+{
+  char const* v = getenv(name);
+  return v != NULL && *v != '\0' ? atof(v) : fallback;
+}
+
 int main(int argc, char* argv[])
 {
   fr_args_t args = init_fr_args(argc, argv);
@@ -440,33 +641,45 @@ int main(int argc, char* argv[])
   rc = pthread_create(&sig_thr, NULL, signal_thread, &set);
   assert(rc == 0);
 
-  char const* duration_env = getenv("SRS_XAPP_DURATION");
-  double const duration_s = duration_env != NULL ? atof(duration_env) : 0.0;
+  double const duration_s = env_number("SRS_XAPP_DURATION", 0.0);
+  double const alive_s = env_number("SRS_XAPP_ALIVE", 30.0);
+  g_verbose = env_number("SRS_XAPP_VERBOSE", 0.0) != 0.0;
+  g_quiet = env_number("SRS_XAPP_QUIET", 0.0) != 0.0;
 
   init_xapp_api(&args);
   sleep(1);
 
   srs_registry_t* reg = srs_registry_new();
   assert(reg != NULL);
-  printf("[SRS xApp] relaying E3 RAN function %u between the dApps of different E2 nodes\n", E3_RAN_FUNCTION);
+  say("started: relaying E3 RAN function %u from reporting dApps to the receiving dApps of other gNBs",
+      E3_RAN_FUNCTION);
 
   uint64_t const start = monotonic_us();
   uint64_t next_scan = 0;
+  uint64_t next_alive = start + (uint64_t)(alive_s * 1e6);
   while (!g_terminate && (duration_s <= 0 || monotonic_us() - start < (uint64_t)(duration_s * 1e6))) {
     if (monotonic_us() >= next_scan) {
       add_new_nodes();
+      expire_receivers();
       next_scan = monotonic_us() + 2000000;
     }
     drain(reg);
-    send_snapshots(reg);
+    if (monotonic_us() >= next_alive) {
+      say("alive: %zu node(s), %zu receiver(s), %zu UE(s); %" PRIu64 " messages, %" PRIu64
+          " anchor refreshes relayed, controls %" PRIu64 " ack / %" PRIu64 " failed in the last %.0f s",
+          g_nof_nodes, g_nof_receivers, srs_registry_nof_ues(reg), g_window.messages, g_window.refreshes,
+          g_window.controls_ok, g_window.controls_failed, alive_s);
+      memset(&g_window, 0, sizeof(g_window));
+      next_alive += (uint64_t)(alive_s * 1e6);
+    }
     usleep(10000);
   }
 
   srs_registry_stats_t s = srs_registry_stats(reg);
-  printf("[SRS xApp] done: %" PRIu64 " messages, %" PRIu64 " refused, %" PRIu64 " sequence gaps, %" PRIu64
-         " updates, controls %" PRIu64 " ack / %" PRIu64 " failed, %zu UEs\n",
-         s.messages, s.invalid, s.sequence_gaps, s.updates, g_controls_ok, g_controls_failed,
-         srs_registry_nof_ues(reg));
+  say("stopped: %" PRIu64 " messages (%" PRIu64 " refused, %" PRIu64 " sequence gaps), %" PRIu64
+      " updates, controls %" PRIu64 " ack / %" PRIu64 " failed, %zu UE(s)",
+      g_total.messages, s.invalid, s.sequence_gaps, s.updates, g_total.controls_ok, g_total.controls_failed,
+      srs_registry_nof_ues(reg));
 
   for (size_t i = 0; i < g_nof_nodes; ++i) {
     rm_report_sm_xapp_api(g_nodes[i].e3_data.u.handle);
