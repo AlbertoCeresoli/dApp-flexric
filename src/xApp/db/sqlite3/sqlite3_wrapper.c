@@ -1590,7 +1590,14 @@ void write_db_sqlite3(sqlite3* db, global_e2_node_id_t const* id, sm_ag_if_rd_t 
   } else if(rd->type ==  RAN_CTRL_STATS_V1_03){
     write_rc_stats(db, id, &rd->rc.ind);
   } else if(rd->type == DAPP_STATS_V0){
-    printf("E2SM-DAPP sqlite not implemented\n");
+    // [srs-sharing] No table for E2SM-DAPP: its indications are not stored, but they still reach the xApp's
+    // callback. Said once per run instead of once per indication, which buried the xApp's own output.
+    static bool told = false;
+    if (!told) {
+      told = true;
+      printf("[xApp]: E2SM-DAPP indications are not stored in the xApp database (no table for them); "
+             "the xApp still receives them\n");
+    }
   } else {
     assert(0!=0 && "Unknown statistics type received ");
   }
