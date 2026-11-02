@@ -8,5 +8,6 @@ add_subdirectory(kpm_rc)
 add_subdirectory(orange)
 if(E3_AGENT)
 add_subdirectory(spectrum)
+add_subdirectory(srs_sharing) # [srs-sharing]
 endif()
 
