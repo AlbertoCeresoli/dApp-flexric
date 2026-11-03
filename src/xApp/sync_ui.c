@@ -46,6 +46,7 @@ void init_sync_ui(sync_ui_t* s)
 
   s->flag_sync = false;
   s->msg_ack = false;
+  s->failure = NULL;
 }
 
 void free_sync_ui(sync_ui_t* s)
@@ -67,6 +68,7 @@ void arm_sync_ui(sync_ui_t* s)
   lock_guard(&s->mtx_sync);
   s->flag_sync = false;
   s->msg_ack = false;
+  s->failure = NULL;
 }
 
 void cond_wait_sync_ui(sync_ui_t* s, uint32_t wait_ms)
@@ -87,12 +89,26 @@ void cond_wait_sync_ui(sync_ui_t* s, uint32_t wait_ms)
     rc = pthread_cond_timedwait(&s->cv_sync, &s->mtx_sync, &ts);
   }
 
-  assert(rc != ETIMEDOUT && "Timeout. No response from the E2 Node received, and neither from epoll. Unforeseen path");
-  assert(rc == 0);
+  // [srs-sharing] No answer in time is an outcome the caller sees (sync_ui_t.failure), not an assert: a node that
+  // disconnected after the RIC accepted the request never answers. The asserts vanished with NDEBUG anyway, and the
+  // caller then went on as if the request had succeeded.
+  if (s->flag_sync == false)
+    s->failure = SYNC_UI_NO_ANSWER;
 
   pthread_mutex_unlock(&s->mtx_sync);
+}
 
-  assert(s->msg_ack == true && "No response to subscription from the RIC received\n" );
+// [srs-sharing]
+void signal_failure_sync_ui(sync_ui_t* s, char const* reason)
+{
+  assert(s != NULL);
+  assert(reason != NULL);
+
+  lock_guard(&s->mtx_sync);
+  s->flag_sync = true;
+  s->msg_ack = true;
+  s->failure = reason;
+  pthread_cond_signal(&s->cv_sync);
 }
 
 void signal_sync_ui(sync_ui_t* s)

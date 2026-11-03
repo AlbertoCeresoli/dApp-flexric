@@ -160,6 +160,24 @@ sctp_info_t find_map_e2_node_sad(map_e2_node_sockaddr_t* m, global_e2_node_id_t 
   return *s;
 }
 
+// [srs-sharing] See the header: false, not an assert, for a node that is not connected.
+bool try_find_map_e2_node_sad(map_e2_node_sockaddr_t* m, global_e2_node_id_t const* id, sctp_info_t* out)
+{
+  assert(m != NULL);
+  assert(id != NULL);
+  assert(out != NULL);
+
+  lock_guard(&m->mtx);
+
+  assoc_rb_tree_t* tree = &m->map.left;
+  void* it = find_if(tree, assoc_front(tree), assoc_end(tree), (global_e2_node_id_t*)id, eq_global_e2_node_id_wrapper);
+  if (it == assoc_end(tree))
+    return false;
+
+  *out = *(sctp_info_t*)assoc_value(tree, it);
+  return true;
+}
+
 global_e2_node_id_t find_map_sad_e2_node(map_e2_node_sockaddr_t* m, sctp_info_t const* s)
 {
   assert(m != NULL);

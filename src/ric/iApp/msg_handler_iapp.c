@@ -420,7 +420,28 @@ e2ap_msg_t e2ap_handle_e42_ric_control_request_iapp(e42_iapp_t* iapp, const e2ap
   e42_ric_control_request_t const* e42_cr = &msg->u_msgs.e42_ric_ctrl_req;
 
   assert(valid_xapp_id(iapp, e42_cr->xapp_id) == true);
-  assert(valid_global_e2_node(iapp, &e42_cr->id));
+
+  // [srs-sharing] The node may have disconnected (a gNB restarting) since the xApp learnt about it. Answer the xApp
+  // with a control failure, cause transport / resource unavailable, which a node itself never sends for a control: the
+  // xApp can tell "node not connected" from a refusal by the node. Before, the request went on and crashed the RIC.
+  if (valid_global_e2_node(iapp, &e42_cr->id) == false) {
+    e2ap_msg_t ans = {.type = RIC_CONTROL_FAILURE};
+    ric_control_failure_t* dst = &ans.u_msgs.ric_ctrl_fail;
+    dst->ric_id = e42_cr->ctrl_req.ric_id;
+    dst->cause.present = CAUSE_TRANSPORT;
+    dst->cause.transport = CAUSE_TRANSPORT_TRANSPORT_RESOURCE_UNAVAILABLE;
+
+    sctp_msg_t sctp_msg = {0};
+    sctp_msg.info = find_map_xapps_sad(&iapp->ep.xapps, e42_cr->xapp_id);
+    sctp_msg.ba = e2ap_msg_enc_iapp(&iapp->ap, &ans);
+    defer({ free_sctp_msg(&sctp_msg); } );
+    e2ap_send_sctp_msg_iapp(&iapp->ep, &sctp_msg);
+
+    printf("[iApp]: E42_RIC_CONTROL_REQUEST for E2 node NB_ID %u, not connected: RIC_CONTROL_FAILURE tx\n",
+           e42_cr->id.nb_id.nb_id);
+    e2ap_msg_t none = {.type = NONE_E2_MSG_TYPE};
+    return none;
+  }
 
   xapp_ric_id_t xapp_ric_id = {.ric_id = e42_cr->ctrl_req.ric_id,
                                 .xapp_id = e42_cr->xapp_id};

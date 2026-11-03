@@ -26,12 +26,17 @@
  * sends the controls (control_sm_xapp_api blocks until the node answers) and every two seconds looks for new E2
  * nodes, so gNBs that connect after the xApp starts are included.
  *
+ * A control that the RIC answers "E2 node not connected", or that gets no answer, means a gNB left or restarted: the
+ * xApp then stops with exit status 3 (EXIT_NODES_CHANGED), because FlexRIC lists the nodes to an xApp only at start
+ * and a restarted node comes back without its subscriptions. tools/run_xapp.sh --respawn starts it again.
+ *
  * Usage: xapp_srs_sharing -c <flexric.conf> -p <SM plugin directory>
  *        (or tools/run_xapp.sh xapp_srs_sharing); Ctrl-C stops it. SRS_XAPP_DURATION=<s> stops it after s seconds.
  */
 #include "../../../../src/util/alg_ds/alg/defer.h"
 #include "../../../../src/util/time_now_us.h"
 #include "../../../../src/xApp/e42_xapp_api.h"
+#include "../../../../src/xApp/sync_ui.h" /* SYNC_UI_*: why a control failed */
 
 #include "srs_sharing.pb-c.h"
 #include "srs_sharing_registry.h"
@@ -61,6 +66,13 @@ static uint32_t const STYLE_SUBSCRIPTION_MAP = 2;
 #define MAX_TRACKED_UES 256
 
 static volatile sig_atomic_t g_terminate = 0;
+
+/* Exit status when a node turned out not to be connected any more (EXIT_NODES_CHANGED, see send_control): FlexRIC
+ * gives an xApp the list of E2 nodes only once, at start, and a node that reconnects (a gNB restart) comes back
+ * without this xApp's subscriptions. Restarting the xApp is what picks up the current nodes: tools/run_xapp.sh
+ * --respawn does it on this status. */
+#define EXIT_NODES_CHANGED 3
+static int g_exit_status = 0;
 
 static void* signal_thread(void* arg)
 {
@@ -516,7 +528,17 @@ static bool send_control(node_t* node, uint32_t dapp_id, srs_packed_t const* p)
   } else {
     g_window.controls_failed++;
     g_total.controls_failed++;
-    error_line("control to dApp %u on node %s failed", dapp_id, node_name(node->key, name, sizeof(name)));
+    char const* reason = ans.u.reason != NULL ? ans.u.reason : "failed";
+    error_line("control to dApp %u on node %s: %s", dapp_id, node_name(node->key, name, sizeof(name)), reason);
+    /* The node left (the RIC says so, or nobody answered): its subscriptions are gone even if it comes back, so stop
+     * and let a restart subscribe to the nodes connected now. A refusal by the node (e.g. a dApp that just left) is
+     * only counted. */
+    if (strcmp(reason, SYNC_UI_NODE_NOT_CONNECTED) == 0 || strcmp(reason, SYNC_UI_NO_ANSWER) == 0) {
+      error_line("node %s is no longer connected: stopping (exit status %d) so that a restart picks up the current "
+                 "E2 nodes", node_name(node->key, name, sizeof(name)), EXIT_NODES_CHANGED);
+      g_exit_status = EXIT_NODES_CHANGED;
+      g_terminate = 1;
+    }
   }
   return ans.success;
 }
@@ -729,5 +751,5 @@ int main(int argc, char* argv[])
   discard_queue(); /* what arrived during shutdown: the xApp API is stopped, nothing can be sent */
   srs_reorder_free(reorder);
   srs_registry_free(reg);
-  return 0;
+  return g_exit_status;
 }

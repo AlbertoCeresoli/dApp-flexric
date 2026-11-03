@@ -308,7 +308,16 @@ void e2_event_loop_xapp(e42_xapp_t* xapp)
 
       assert(*e.p_ev != E42_RIC_SUBSCRIPTION_REQUEST_PENDING_EVENT && "Timeout waiting for Report. Connection lost with the RIC?");
       assert(*e.p_ev != E42_RIC_SUBSCRIPTION_DELETE_REQUEST_PENDING_EVENT  && "Timeout waiting for Subscription Delete. Connection lost with the RIC?");
-      assert(*e.p_ev != E42_RIC_CONTROL_REQUEST_PENDING_EVENT && "Timeout waiting for Control ACK. Connection lost with the RIC?");
+      // [srs-sharing] A control left unanswered (its node disconnected after the RIC forwarded it): end that request
+      // only. The caller's wait reports it as failed (sync_ui.h). Before, with NDEBUG the assert above was gone and
+      // the code below re-sent the E42 setup request to the RIC on every expiry of this periodic timer.
+      if (*e.p_ev == E42_RIC_CONTROL_REQUEST_PENDING_EVENT) {
+        printf("[xApp]: no answer to a CONTROL request in time\n");
+        consume_fd(fd);
+        rm_pending_event_fd(&xapp->pending, fd);
+        rm_fd_asio_xapp(&xapp->io, fd);
+        continue;
+      }
 
       // Resend the subscription request message
       e42_setup_request_t sr = generate_e42_setup_request(xapp);
@@ -547,13 +556,18 @@ sm_ans_xapp_t control_sm_sync_xapp(e42_xapp_t* xapp, global_e2_node_id_t* id, ui
   // Wait for the answer (it will arrive in the event loop)
   cond_wait_sync_ui(&xapp->sync, xapp->sync.wait_ms);
 
-  // Answer received
-  printf("[xApp]: Successfully received CONTROL response\n");
+  // [srs-sharing] The outcome, no longer always "success": a control failure or no answer at all comes back with
+  // its reason (sync_ui.h), so that the xApp can count it and tell a node that left from a node that refused.
+  char const* failure = xapp->sync.failure;
+  if (failure == NULL)
+    printf("[xApp]: Successfully received CONTROL response\n");
 
   // Remove the active procedure, control request  
   rm_act_proc(&xapp->act_proc, ric_id.ric_req_id ); 
  
-  sm_ans_xapp_t const ans = {.success = true};
+  sm_ans_xapp_t ans = {.success = failure == NULL};
+  if (failure != NULL)
+    ans.u.reason = (char*)failure;
   return ans;
 }
 

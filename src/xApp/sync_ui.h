@@ -33,6 +33,9 @@ typedef struct{
   int wait_ms;
   bool flag_sync; // = false;
   bool msg_ack; // = false;
+  // [srs-sharing] Why the answer was not a success (NULL: success). Set by signal_failure_sync_ui, or by
+  // cond_wait_sync_ui when no answer came in time. Static strings, never freed.
+  char const* failure;
 } sync_ui_t;
 
 void init_sync_ui(sync_ui_t* s);
@@ -46,6 +49,14 @@ void arm_sync_ui(sync_ui_t* s);
 void cond_wait_sync_ui(sync_ui_t* s, uint32_t ms);
 
 void signal_sync_ui(sync_ui_t* s); 
+
+// [srs-sharing] Like signal_sync_ui, for a negative answer (e.g. a control failure): the waiter sees `reason`.
+void signal_failure_sync_ui(sync_ui_t* s, char const* reason);
+
+// [srs-sharing] Strings in sync_ui_t.failure the xApps compare against.
+#define SYNC_UI_NO_ANSWER "no answer"
+#define SYNC_UI_NODE_NOT_CONNECTED "E2 node not connected"
+#define SYNC_UI_REFUSED "refused by the E2 node"
 
 #endif
 

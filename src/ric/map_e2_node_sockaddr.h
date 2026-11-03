@@ -31,6 +31,7 @@
 #include "../lib/ep/sctp_msg.h"
 
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <pthread.h>
 
 typedef struct{
@@ -58,6 +59,11 @@ sctp_info_t find_map_e2_node_sad(map_e2_node_sockaddr_t* m, global_e2_node_id_t 
 sctp_info_t find_map_e2_node_sad(map_e2_node_sockaddr_t * m, global_e2_node_id_t const* id);
 
 global_e2_node_id_t find_map_sad_e2_node(map_e2_node_sockaddr_t* m, sctp_info_t const* s);
+
+// [srs-sharing] Like find_map_e2_node_sad, but returns false when the node is not (or no longer) connected instead of
+// asserting: an xApp request can name a node whose SCTP association closed a moment before (a gNB restarting), and
+// with NDEBUG the assert vanished and the lookup dereferenced NULL, killing the RIC.
+bool try_find_map_e2_node_sad(map_e2_node_sockaddr_t* m, global_e2_node_id_t const* id, sctp_info_t* out);
 
 #endif
 

@@ -792,6 +792,17 @@ void stop_near_ric_iapp()
 //  assert(0!=0 && "not implemented");
 }
 
+// [srs-sharing] A request to a node that disconnected was not sent: cancel the timer armed for its answer. Left
+// behind, that periodic timer fired every 3 s forever ("Pending event timeout happened"), the RIC's degraded state.
+static void drop_pending_event(near_ric_t* ric, pending_event_ric_t* ev)
+{
+  lock_guard(&ric->pend_mtx);
+  void (*free_pending_event)(void*) = NULL;
+  int* fd = bi_map_extract_right(&ric->pending, ev, sizeof(*ev), free_pending_event);
+  rm_fd_asio_ric(&ric->io, *fd);
+  free(fd);
+}
+
 uint16_t fwd_ric_subscription_request(near_ric_t* ric, global_e2_node_id_t const* id, ric_subscription_request_t const* sr, void (*f)(e2ap_msg_t const* msg))
 {
   assert(ric != NULL);
@@ -820,7 +831,8 @@ uint16_t fwd_ric_subscription_request(near_ric_t* ric, global_e2_node_id_t const
   byte_array_t ba_msg = e2ap_enc_subscription_request_ric(&ric->ap, sr); 
   defer({ free_byte_array(ba_msg); });
 
-  e2ap_send_bytes_ric(&ric->ep, id, ba_msg);
+  if (e2ap_send_bytes_ric(&ric->ep, id, ba_msg) == false)  // [srs-sharing] node gone
+    drop_pending_event(ric, &ev);
    
   return ric_req_id;
 }
@@ -855,7 +867,10 @@ void fwd_ric_subscription_request_delete(near_ric_t* ric, global_e2_node_id_t co
   byte_array_t ba_msg = e2ap_enc_subscription_delete_request_ric(&ric->ap, sdr); 
   defer({ free_byte_array(ba_msg); });
 
-  e2ap_send_bytes_ric(&ric->ep, id, ba_msg);
+  if (e2ap_send_bytes_ric(&ric->ep, id, ba_msg) == false) {  // [srs-sharing] node gone: nothing to delete there
+    drop_pending_event(ric, &ev);
+    return;
+  }
 
   printf("[NEAR-RIC]: SUBSCRIPTION DELETE REQUEST tx RAN FUNC ID %d RIC_REQ_ID %d \n", sdr->ric_id.ran_func_id, sdr->ric_id.ric_req_id);
 }
@@ -886,7 +901,12 @@ uint16_t fwd_ric_control_request(near_ric_t* ric, global_e2_node_id_t const* id,
   byte_array_t ba_msg = e2ap_enc_control_request_ric(&ric->ap, cr); 
   defer({ free_byte_array(ba_msg); } );
 
-  e2ap_send_bytes_ric(&ric->ep, id, ba_msg);
+  // [srs-sharing] Node gone after the iApp's check (see e2ap_handle_e42_ric_control_request_iapp): no answer will
+  // come, so the xApp's wait runs to its timeout and reports the control as failed.
+  if (e2ap_send_bytes_ric(&ric->ep, id, ba_msg) == false) {
+    drop_pending_event(ric, &ev);
+    return ric_req_id;
+  }
 
   printf("[NEAR-RIC]: CONTROL SERVICE sent\n");
 

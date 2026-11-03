@@ -115,17 +115,23 @@ sctp_msg_t e2ap_recv_msg_ric(e2ap_ep_ric_t* ep)
   return rcv;
 }
 
-void e2ap_send_bytes_ric(const e2ap_ep_ric_t* ep, global_e2_node_id_t const* id , byte_array_t ba)
+bool e2ap_send_bytes_ric(const e2ap_ep_ric_t* ep, global_e2_node_id_t const* id , byte_array_t ba)
 {
   assert(ba.buf && ba.len > 0);
   assert(ep != NULL);
 
-  sctp_info_t s = find_map_e2_node_sad(( map_e2_node_sockaddr_t*)&ep->e2_nodes, id);
+  // [srs-sharing] The node may have disconnected between the xApp's request and now: drop the message.
+  sctp_info_t s = {0};
+  if (try_find_map_e2_node_sad((map_e2_node_sockaddr_t*)&ep->e2_nodes, id, &s) == false) {
+    printf("[NEAR-RIC]: E2 node NB_ID %u not connected (any more): message dropped\n", id->nb_id.nb_id);
+    return false;
+  }
 
   sctp_msg_t msg = {.ba = ba,
                     .info = s};
 
   e2ap_send_sctp_msg(&ep->base, &msg); // s.addr, &s.sri, ba);
+  return true;
 }
 
 void e2ap_send_sctp_msg_ric(const  e2ap_ep_ric_t* ep, sctp_msg_t* msg)

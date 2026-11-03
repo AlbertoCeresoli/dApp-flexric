@@ -329,8 +329,12 @@ sm_ind_data_t ind_sm_payload(ric_indication_t const* src)
   // Stop the timer
   rm_pending_event_xapp(xapp, &ev);
 
-  // Unblock UI thread
-  signal_sync_ui(&xapp->sync);
+  // Unblock UI thread. [srs-sharing] With the reason: the RIC answers a control to a node that is no longer connected
+  // with cause transport / resource unavailable (e2ap_handle_e42_ric_control_request_iapp); any other cause comes
+  // from the node itself (e.g. an unknown dApp).
+  bool const not_connected = failure->cause.present == CAUSE_TRANSPORT
+                             && failure->cause.transport == CAUSE_TRANSPORT_TRANSPORT_RESOURCE_UNAVAILABLE;
+  signal_failure_sync_ui(&xapp->sync, not_connected ? SYNC_UI_NODE_NOT_CONNECTED : SYNC_UI_REFUSED);
 
   e2ap_msg_t ans = {.type = NONE_E2_MSG_TYPE};
   return ans;
