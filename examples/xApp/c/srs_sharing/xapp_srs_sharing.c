@@ -18,8 +18,9 @@
  * checkpoints.py), tag [srs-xapp]: start, each node subscribed, each receiver announced or gone, each UE's new
  * configuration, timing advance change and release with how many receivers acknowledged it, and every failed
  * control. Updates that only refresh a UE's slot anchor are counted in an "alive" line every 30 s.
- * SRS_XAPP_VERBOSE=1 prints every update and control, SRS_XAPP_QUIET=1 errors only. FlexRIC's own lines
- * ("[xApp]: ...") are printed by its library, not by this file.
+ * SRS_XAPP_VERBOSE=1 prints every update and control (and every message received), SRS_XAPP_QUIET=1 errors only;
+ * SRS_XAPP_HOLD_MS sets how long a message waits for an earlier one of the same dApp (default 1000).
+ * FlexRIC's own lines ("[xApp]: ...") are printed by its library, not by this file.
  *
  * Threads: the indication callbacks run on FlexRIC's threads and only queue work; the main loop drains the queue,
  * sends the controls (control_sm_xapp_api blocks until the node answers) and every two seconds looks for new E2
@@ -34,6 +35,7 @@
 
 #include "srs_sharing.pb-c.h"
 #include "srs_sharing_registry.h"
+#include "srs_sharing_reorder.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -575,28 +577,52 @@ static void send_snapshot(srs_registry_t* reg, size_t receiver)
     say("  no foreign UE known yet for it");
 }
 
-static void drain(srs_registry_t* reg)
+/* Handles one message, in its sender's sequence order. */
+static void handle(srs_registry_t* reg, srs_source_t src, uint8_t const* data, size_t len)
+{
+  g_window.messages++;
+  g_total.messages++;
+  node_key_t const source = key_from_header(src.plmn, src.nb_id);
+  /* Hellos are about receivers, not UEs: the xApp keeps them; everything else goes to the registry. */
+  SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, len, data);
+  if (m != NULL && m->body_case == SRS_SHARING__V1__SRS_SHARING_MESSAGE__BODY_RECEIVER_HELLO) {
+    if (on_hello(src, m->receiver_hello))
+      send_snapshot(reg, g_nof_receivers - 1);
+  } else {
+    srs_packed_t updates[MAX_UPDATES];
+    size_t n = srs_registry_on_payload(reg, src, data, len, monotonic_us(), updates, MAX_UPDATES);
+    for (size_t i = 0; i < n; ++i) {
+      send_update(&updates[i], source, -1);
+      free(updates[i].buf);
+    }
+  }
+  if (m != NULL)
+    srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
+}
+
+/* Moves what the callbacks queued into the reorder buffer (the RIC can swap messages a dApp sent milliseconds apart),
+ * then handles everything due, in each sender's sequence order. */
+static void drain(srs_registry_t* reg, srs_reorder_t* reorder)
 {
   pthread_mutex_lock(&g_mtx);
   work_t* w = g_head;
   g_head = g_tail = NULL;
   pthread_mutex_unlock(&g_mtx);
+  uint64_t const now = monotonic_us();
   while (w != NULL) {
-    g_window.messages++;
-    g_total.messages++;
-    node_key_t const source = key_from_header(w->src.plmn, w->src.nb_id);
-    /* Hellos are about receivers, not UEs: the xApp keeps them; everything else goes to the registry. */
     SrsSharing__V1__SrsSharingMessage* m = srs_sharing__v1__srs_sharing_message__unpack(NULL, w->len, w->data);
-    if (m != NULL && m->body_case == SRS_SHARING__V1__SRS_SHARING_MESSAGE__BODY_RECEIVER_HELLO) {
-      if (on_hello(w->src, m->receiver_hello))
-        send_snapshot(reg, g_nof_receivers - 1);
-    } else {
-      srs_packed_t updates[MAX_UPDATES];
-      size_t n = srs_registry_on_payload(reg, w->src, w->data, w->len, monotonic_us(), updates, MAX_UPDATES);
-      for (size_t i = 0; i < n; ++i) {
-        send_update(&updates[i], source, -1);
-        free(updates[i].buf);
+    if (m != NULL && m->header != NULL) {
+      if (g_verbose) {
+        char name[32];
+        say("  <- node %s dApp %u: sequence %" PRIu64 ", body %d",
+            node_name(key_from_header(w->src.plmn, w->src.nb_id), name, sizeof(name)), w->src.dapp_id,
+            m->header->sequence, (int)m->body_case);
       }
+      srs_reorder_push(reorder, (srs_item_t){.src = w->src, .sequence = m->header->sequence, .data = w->data,
+                                             .len = w->len}, now);
+      w->data = NULL;  /* now owned by the reorder buffer */
+    } else {
+      handle(reg, w->src, w->data, w->len);  /* undecodable: the registry counts it as refused */
     }
     if (m != NULL)
       srs_sharing__v1__srs_sharing_message__free_unpacked(m, NULL);
@@ -604,6 +630,11 @@ static void drain(srs_registry_t* reg)
     free(w->data);
     free(w);
     w = next;
+  }
+  srs_item_t item;
+  while (srs_reorder_pop(reorder, monotonic_us(), &item)) {
+    handle(reg, item.src, item.data, item.len);
+    free(item.data);
   }
 }
 
@@ -651,6 +682,10 @@ int main(int argc, char* argv[])
 
   srs_registry_t* reg = srs_registry_new();
   assert(reg != NULL);
+  /* Swaps seen live are a few milliseconds, but one straggler came more than 200 ms late; waiting only costs anything
+   * when a message is missing, so wait up to a second before taking it as lost. */
+  srs_reorder_t* reorder = srs_reorder_new((uint64_t)(env_number("SRS_XAPP_HOLD_MS", 1000.0) * 1000));
+  assert(reorder != NULL);
   say("started: relaying E3 RAN function %u from reporting dApps to the receiving dApps of other gNBs",
       E3_RAN_FUNCTION);
 
@@ -663,7 +698,7 @@ int main(int argc, char* argv[])
       expire_receivers();
       next_scan = monotonic_us() + 2000000;
     }
-    drain(reg);
+    drain(reg, reorder);
     if (monotonic_us() >= next_alive) {
       say("alive: %zu node(s), %zu receiver(s), %zu UE(s); %" PRIu64 " messages, %" PRIu64
           " anchor refreshes relayed, controls %" PRIu64 " ack / %" PRIu64 " failed in the last %.0f s",
@@ -676,10 +711,11 @@ int main(int argc, char* argv[])
   }
 
   srs_registry_stats_t s = srs_registry_stats(reg);
-  say("stopped: %" PRIu64 " messages (%" PRIu64 " refused, %" PRIu64 " sequence gaps), %" PRIu64
-      " updates, controls %" PRIu64 " ack / %" PRIu64 " failed, %zu UE(s)",
-      g_total.messages, s.invalid, s.sequence_gaps, s.updates, g_total.controls_ok, g_total.controls_failed,
-      srs_registry_nof_ues(reg));
+  srs_reorder_stats_t o = srs_reorder_stats(reorder);
+  say("stopped: %" PRIu64 " messages (%" PRIu64 " refused, %" PRIu64 " sequence gaps; %" PRIu64 " put back in order, %"
+      PRIu64 " lost, %" PRIu64 " dropped), %" PRIu64 " updates, controls %" PRIu64 " ack / %" PRIu64 " failed, %zu UE(s)",
+      g_total.messages, s.invalid, s.sequence_gaps, o.reordered, o.given_up, o.dropped, s.updates,
+      g_total.controls_ok, g_total.controls_failed, srs_registry_nof_ues(reg));
 
   for (size_t i = 0; i < g_nof_nodes; ++i) {
     rm_report_sm_xapp_api(g_nodes[i].e3_data.u.handle);
@@ -691,6 +727,7 @@ int main(int argc, char* argv[])
   for (size_t i = 0; i < g_nof_nodes; ++i)
     free_global_e2_node_id(&g_nodes[i].id);
   discard_queue(); /* what arrived during shutdown: the xApp API is stopped, nothing can be sent */
+  srs_reorder_free(reorder);
   srs_registry_free(reg);
   return 0;
 }

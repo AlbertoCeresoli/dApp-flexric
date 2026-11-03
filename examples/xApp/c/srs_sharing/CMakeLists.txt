@@ -17,8 +17,10 @@ add_custom_command(
   DEPENDS ${SRS_SHARING_PROTO_DIR}/srs_sharing.proto
   COMMENT "protoc-c srs_sharing.proto")
 
-# The registry (UEs, timing advance ledger, updates) has no FlexRIC dependency, so it is tested on its own.
-add_library(srs_sharing_registry STATIC srs_sharing_registry.c ${CMAKE_CURRENT_BINARY_DIR}/srs_sharing.pb-c.c)
+# The registry (UEs, timing advance ledger, updates) and the reorder buffer have no FlexRIC dependency, so they are
+# tested on their own.
+add_library(srs_sharing_registry STATIC srs_sharing_registry.c srs_sharing_reorder.c
+            ${CMAKE_CURRENT_BINARY_DIR}/srs_sharing.pb-c.c)
 target_include_directories(srs_sharing_registry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(srs_sharing_registry PUBLIC ${PROTOBUF_C_LIBRARY})
 
@@ -39,3 +41,8 @@ target_link_libraries(test_srs_sharing_registry PRIVATE srs_sharing_registry)
 # Built with NDEBUG in Release: keep the test's asserts.
 target_compile_options(test_srs_sharing_registry PRIVATE -UNDEBUG)
 add_test(NAME test_srs_sharing_registry COMMAND test_srs_sharing_registry)
+
+add_executable(test_srs_sharing_reorder test_srs_sharing_reorder.c)
+target_link_libraries(test_srs_sharing_reorder PRIVATE srs_sharing_registry)
+target_compile_options(test_srs_sharing_reorder PRIVATE -UNDEBUG)
+add_test(NAME test_srs_sharing_reorder COMMAND test_srs_sharing_reorder)
