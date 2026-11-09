@@ -22,6 +22,7 @@
 #ifndef MAP_RIC_ID_H
 #define MAP_RIC_ID_H 
 
+#include <stdbool.h>
 #include "../../util/alg_ds/ds/assoc_container/assoc_generic.h"
 
 #include "e2_node_ric_id.h"
@@ -53,6 +54,10 @@ void rm_map_ric_id(map_ric_id_t* map, xapp_ric_id_t const* ric_id);
 xapp_ric_id_xpct_t find_xapp_map_ric_id(map_ric_id_t* map, uint16_t ric_req_id);
 
 e2_node_ric_id_t find_ric_req_map_ric_id(map_ric_id_t* map, xapp_ric_id_t* x);
+
+// [srs-sharing] Like find_ric_req_map_ric_id, but false instead of an assert when the xApp's request is unknown: an
+// xApp that outlived a RIC restart deletes subscriptions this RIC never saw, and the lookup used to crash the RIC.
+bool try_find_ric_req_map_ric_id(map_ric_id_t* map, xapp_ric_id_t* x, e2_node_ric_id_t* out);
 
 // array of e2_node_ric_id_t 
 seq_arr_t find_all_subs_map_ric_id(map_ric_id_t* map, uint16_t xapp_id); 

@@ -212,6 +212,24 @@ xapp_ric_id_xpct_t find_xapp_map_ric_id(map_ric_id_t* map, uint16_t ric_req_id)
   return ans;
 }
 
+// [srs-sharing] See the header.
+bool try_find_ric_req_map_ric_id(map_ric_id_t* map, xapp_ric_id_t* x, e2_node_ric_id_t* out)
+{
+  assert(map != NULL);
+  assert(out != NULL);
+
+  int rc = pthread_rwlock_rdlock(&map->rw);
+  assert(rc == 0);
+  assoc_rb_tree_t* r = &map->bimap.right;
+  void* it = find_if(r, assoc_front(r), assoc_end(r), x, eq_xapp_ric_gen_id_wrapper);
+  bool const found = it != assoc_end(r);
+  if (found)
+    *out = *(e2_node_ric_id_t*)assoc_value(r, it);
+  rc = pthread_rwlock_unlock(&map->rw);
+  assert(rc == 0);
+  return found;
+}
+
 e2_node_ric_id_t find_ric_req_map_ric_id(map_ric_id_t* map, xapp_ric_id_t* x)
 {
   assert(map != NULL);

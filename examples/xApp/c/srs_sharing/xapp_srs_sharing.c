@@ -682,6 +682,9 @@ static double env_number(char const* name, double fallback)
 
 int main(int argc, char* argv[])
 {
+  /* Line-buffered output even into a file: FlexRIC's library prints with printf, and a block-buffered log loses its
+   * last lines when the process dies, which are the ones that explain why. */
+  setvbuf(stdout, NULL, _IOLBF, 0);
   fr_args_t args = init_fr_args(argc, argv);
 
   sigset_t set;

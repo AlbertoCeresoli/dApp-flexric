@@ -288,7 +288,14 @@ sm_ind_data_t ind_sm_payload(ric_indication_t const* src)
   assert( ack->status == RIC_CONTROL_STATUS_SUCCESS && "Only success supported ") ;
 #endif
   act_proc_ans_t rv = find_act_proc(&xapp->act_proc, ack->ric_id.ric_req_id);
-  assert(rv.ok == true && "ric_req_id not registered in the registry");
+  // [srs-sharing] An answer can come after its request ended: the 5 s timer gave up on it (see e2_event_loop_xapp)
+  // and the caller has moved on. Ignore it: the request is no longer registered and must not be removed twice
+  // (the containers crash on a missing key; with NDEBUG the assert above this used to be is gone).
+  if (rv.ok == false) {
+    printf("[xApp]: CONTROL ACK for request %u that already ended (late answer): ignored\n", ack->ric_id.ric_req_id);
+    e2ap_msg_t none = {.type = NONE_E2_MSG_TYPE};
+    return none;
+  }
 
   printf("[xApp]: CONTROL ACK rx\n");
 
@@ -296,8 +303,9 @@ sm_ind_data_t ind_sm_payload(ric_indication_t const* src)
   // after which an event will be generated
   pending_event_xapp_t ev = {.ev = E42_RIC_CONTROL_REQUEST_PENDING_EVENT, .id = rv.val.id };
 
-  // Stop the timer
-  rm_pending_event_xapp(xapp, &ev);
+  // Stop the timer ([srs-sharing] unless it already fired: the answer came between the timer and the end of the wait)
+  if (find_pending_event_ev(&xapp->pending, &ev))
+    rm_pending_event_xapp(xapp, &ev);
 
   // Unblock UI thread  
   signal_sync_ui(&xapp->sync);
@@ -318,7 +326,13 @@ sm_ind_data_t ind_sm_payload(ric_indication_t const* src)
 
   ric_control_failure_t const* failure = &msg->u_msgs.ric_ctrl_fail;
   act_proc_ans_t rv = find_act_proc(&xapp->act_proc, failure->ric_id.ric_req_id);
-  assert(rv.ok == true && "ric_req_id not registered in the registry");
+  // [srs-sharing] As for the ACK: a failure for a request that already ended is ignored.
+  if (rv.ok == false) {
+    printf("[xApp]: CONTROL FAILURE for request %u that already ended (late answer): ignored\n",
+           failure->ric_id.ric_req_id);
+    e2ap_msg_t none = {.type = NONE_E2_MSG_TYPE};
+    return none;
+  }
 
   printf("[xApp]: CONTROL FAILURE rx\n");
 
@@ -326,8 +340,9 @@ sm_ind_data_t ind_sm_payload(ric_indication_t const* src)
   // after which an event will be generated
   pending_event_xapp_t ev = {.ev = E42_RIC_CONTROL_REQUEST_PENDING_EVENT, .id = rv.val.id };
 
-  // Stop the timer
-  rm_pending_event_xapp(xapp, &ev);
+  // Stop the timer ([srs-sharing] unless it already fired)
+  if (find_pending_event_ev(&xapp->pending, &ev))
+    rm_pending_event_xapp(xapp, &ev);
 
   // Unblock UI thread. [srs-sharing] With the reason: the RIC answers a control to a node that is no longer connected
   // with cause transport / resource unavailable (e2ap_handle_e42_ric_control_request_iapp); any other cause comes

@@ -459,9 +459,22 @@ void e2_event_loop_ric(near_ric_t* ric)
           }
         case PENDING_EVENT:
           {
-            printf("Pending event timeout happened. Communication with E2 Node lost?\n");
+            // [srs-sharing] The request's answer did not come in time (typically its E2 node disconnected while it
+            // was in flight): give up on it, once. Before, the periodic timer stayed armed and this line repeated
+            // every 3 s for as long as the RIC ran. A late answer is then ignored by stop_pending_event.
             consume_fd(e.fd);
-
+            pending_event_ric_t* expired = NULL;
+            {
+              lock_guard(&ric->pend_mtx);
+              int fd = e.fd;
+              void (*free_fd)(void*) = NULL;
+              expired = bi_map_extract_left(&ric->pending, &fd, sizeof(fd), free_fd);
+            }
+            rm_fd_asio_ric(&ric->io, e.fd);
+            printf("Pending event timeout happened. Communication with E2 Node lost? (event %d, RIC_REQ_ID %d: "
+                   "given up)\n", expired != NULL ? (int)expired->ev : -1,
+                   expired != NULL ? expired->id.ric_req_id : -1);
+            free(expired);
             break;
           }
         case SCTP_CONNECTION_SHUTDOWN_EVENT: 

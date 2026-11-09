@@ -27,6 +27,7 @@
 #include "endpoint_ric.h"
 #include "msg_handler_ric.h"
 #include "util/alg_ds/alg/alg.h"
+#include "util/alg_ds/ds/assoc_container/assoc_generic.h"
 #include "util/compare.h"
 #include "util/ngran_types.h"
 #include "e2ap_ric.h"
@@ -73,6 +74,15 @@ void stop_pending_event(near_ric_t* ric, pending_event_ric_t* ev )
 
   int rc = pthread_mutex_lock(&ric->pend_mtx);
   assert(rc == 0);
+  // [srs-sharing] The request may already have been given up on (its timer fired, see e2_event_loop_ric): a late
+  // answer then finds no entry, and extracting a missing key crashes the container.
+  assoc_rb_tree_t* tree = &ric->pending.right;
+  if (find_if(tree, assoc_front(tree), assoc_end(tree), ev, eq_pending_event_ric) == assoc_end(tree)) {
+    rc = pthread_mutex_unlock(&ric->pend_mtx);
+    assert(rc == 0);
+    printf("[NEAR-RIC]: answer to RIC_REQ_ID %d after it was given up on: ignored\n", ev->id.ric_req_id);
+    return;
+  }
   void (*free_pending_event)(void*) = NULL; 
   int* fd = bi_map_extract_right(&ric->pending, ev, sizeof(*ev), free_pending_event);
   rc = pthread_mutex_unlock(&ric->pend_mtx);

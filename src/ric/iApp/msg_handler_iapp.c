@@ -357,7 +357,14 @@ e2ap_msg_t e2ap_handle_e42_ric_subscription_delete_request_iapp(e42_iapp_t* iapp
                       .xapp_id = src->xapp_id 
                     };
 
-  e2_node_ric_id_t n = find_ric_req_map_ric_id(&iapp->map_ric_id, &x);
+  // [srs-sharing] Unknown request: the xApp subscribed through an earlier run of this RIC. Nothing to delete here.
+  e2_node_ric_id_t n = {0};
+  if (try_find_ric_req_map_ric_id(&iapp->map_ric_id, &x, &n) == false) {
+    printf("[iApp]: E42_RIC_SUBSCRIPTION_DELETE_REQUEST from xApp %d for RIC_REQ_ID %d unknown to this RIC (made "
+           "before a RIC restart?): ignored\n", src->xapp_id, src->sdr.ric_id.ric_req_id);
+    e2ap_msg_t none = {.type = NONE_E2_MSG_TYPE};
+    return none;
+  }
   assert(n.ric_req_type == SUBSCRIPTION_RIC_REQUEST_TYPE);
 
   ric_subscription_delete_request_t dst = cp_ric_subscription_delete_request(&src->sdr);
