@@ -23,12 +23,15 @@
  * FlexRIC's own lines ("[xApp]: ...") are printed by its library, not by this file.
  *
  * Threads: the indication callbacks run on FlexRIC's threads and only queue work; the main loop drains the queue,
- * sends the controls (control_sm_xapp_api blocks until the node answers) and every two seconds looks for new E2
- * nodes, so gNBs that connect after the xApp starts are included.
+ * sends the controls (control_sm_xapp_api blocks until the node answers) and every two seconds compares its nodes
+ * with the RIC's node list (sync_nodes).
  *
- * A control that the RIC answers "E2 node not connected", or that gets no answer, means a gNB left or restarted: the
- * xApp then stops with exit status 3 (EXIT_NODES_CHANGED), because FlexRIC lists the nodes to an xApp only at start
- * and a restarted node comes back without its subscriptions. tools/run_xapp.sh --respawn starts it again.
+ * E2 nodes that come and go: the RIC of this tree sends every xApp its node list again whenever a node connects or
+ * leaves, and the xApp library keeps it (stock FlexRIC lists the nodes only once, when the xApp connects). A gNB that
+ * connects later is then subscribed; one that leaves is dropped, with its receivers, and its UEs are released to the
+ * other gNBs; one that restarts is dropped and subscribed again. As a fallback (e.g. a stock RIC), a control that the
+ * RIC answers "E2 node not connected", or that gets no answer, still stops the xApp with exit status 3
+ * (EXIT_NODES_CHANGED), and tools/run_xapp.sh --respawn starts it again.
  *
  * Usage: xapp_srs_sharing -c <flexric.conf> -p <SM plugin directory>
  *        (or tools/run_xapp.sh xapp_srs_sharing); Ctrl-C stops it. SRS_XAPP_DURATION=<s> stops it after s seconds.
@@ -67,10 +70,10 @@ static uint32_t const STYLE_SUBSCRIPTION_MAP = 2;
 
 static volatile sig_atomic_t g_terminate = 0;
 
-/* Exit status when a node turned out not to be connected any more (EXIT_NODES_CHANGED, see send_control): FlexRIC
- * gives an xApp the list of E2 nodes only once, at start, and a node that reconnects (a gNB restart) comes back
- * without this xApp's subscriptions. Restarting the xApp is what picks up the current nodes: tools/run_xapp.sh
- * --respawn does it on this status. */
+/* Exit status when a node turned out not to be connected any more (EXIT_NODES_CHANGED, see send_control). With this
+ * tree's RIC the node list follows node changes (sync_nodes) and this only happens in the moments before the list
+ * arrives; with a stock FlexRIC, which gives an xApp the nodes only once, restarting the xApp is what picks up the
+ * current nodes: tools/run_xapp.sh --respawn does it on this status. */
 #define EXIT_NODES_CHANGED 3
 static int g_exit_status = 0;
 
@@ -313,33 +316,23 @@ static sm_ans_xapp_t subscribe(global_e2_node_id_t const* id, uint32_t style, sm
   return ans;
 }
 
-/* Subscribes to both report styles on every E2SM-DAPP node not seen before. */
-static void add_new_nodes(void)
+/* Subscribes to both report styles of one node; false (and nothing kept) when either is refused. */
+static bool subscribe_node(e2_node_connected_xapp_t const* n)
 {
-  e2_node_arr_xapp_t arr = e2_nodes_xapp_api();
-  defer({ free_e2_node_arr_xapp(&arr); });
-  for (size_t i = 0; i < arr.len; ++i) {
-    e2_node_connected_xapp_t const* n = &arr.n[i];
-    node_key_t key = key_from_node(&n->id);
-    bool known = false;
-    for (size_t j = 0; j < g_nof_nodes; ++j)
-      known = known || same_node(g_nodes[j].key, key);
-    if (known || !offers_dapp(n) || g_nof_nodes == MAX_NODES)
-      continue;
-    char name[32];
-    node_t* node = &g_nodes[g_nof_nodes];
-    node->id = cp_global_e2_node_id(&n->id);
-    node->key = key;
-    node->e3_data = subscribe(&node->id, STYLE_E3_DATA, on_e3_data);
-    node->map = subscribe(&node->id, STYLE_SUBSCRIPTION_MAP, on_subscription_map);
-    if (!node->e3_data.success || !node->map.success) {
-      error_line("node %s: E2SM-DAPP subscription failed", node_name(key, name, sizeof(name)));
-      free_global_e2_node_id(&node->id);
-      continue;
-    }
-    g_nof_nodes++;
-    say("node %s: subscribed to its dApps' reports and dApp map", node_name(key, name, sizeof(name)));
+  char name[32];
+  node_t* node = &g_nodes[g_nof_nodes];
+  node->id = cp_global_e2_node_id(&n->id);
+  node->key = key_from_node(&n->id);
+  node->e3_data = subscribe(&node->id, STYLE_E3_DATA, on_e3_data);
+  node->map = subscribe(&node->id, STYLE_SUBSCRIPTION_MAP, on_subscription_map);
+  if (!node->e3_data.success || !node->map.success) {
+    error_line("node %s: E2SM-DAPP subscription failed", node_name(node->key, name, sizeof(name)));
+    free_global_e2_node_id(&node->id);
+    return false;
   }
+  g_nof_nodes++;
+  say("node %s: subscribed to its dApps' reports and dApp map", node_name(node->key, name, sizeof(name)));
+  return true;
 }
 
 static node_t* node_of(node_key_t key)
@@ -409,6 +402,88 @@ static void expire_receivers(void)
     }
     ++i;
   }
+}
+
+static void send_update(srs_packed_t const* p, node_key_t source, long only);
+
+/* A node that left the RIC (the RIC's node list no longer has it): its subscriptions ended with its connection, so
+ * they are only forgotten here (a delete would go to a node that is not there, and wait for an answer that never
+ * comes). Its receivers go with it, and its UEs are released to the receivers of the other gNBs, since its reporter
+ * cannot report their release any more. */
+static void drop_node(size_t idx, srs_registry_t* reg)
+{
+  node_t* node = &g_nodes[idx];
+  node_key_t const key = node->key;
+  char name[32];
+  say("node %s left the RIC: forgetting its subscriptions", node_name(key, name, sizeof(name)));
+  for (size_t i = 0; i < g_nof_receivers;) {
+    if (same_node(g_receivers[i].node, key)) {
+      say("receiver dApp %u on node %s left with its gNB: forgotten", g_receivers[i].dapp_id, name);
+      g_receivers[i] = g_receivers[--g_nof_receivers];
+      continue;
+    }
+    ++i;
+  }
+  pthread_mutex_lock(&g_mtx);
+  dapp_map_t* m = map_of(key);
+  if (m != NULL)
+    m->nof_dapps = 0;
+  pthread_mutex_unlock(&g_mtx);
+  char plmn[16]; /* as serves() names a cell's PLMN */
+  snprintf(plmn, sizeof(plmn), "%03u%0*u", key.mcc, key.mnc_len == 3 ? 3 : 2, key.mnc);
+  srs_packed_t updates[MAX_UPDATES];
+  size_t const n = srs_registry_release_gnb(reg, plmn, key.nb_id, monotonic_us(), updates, MAX_UPDATES);
+  for (size_t i = 0; i < n; ++i) {
+    send_update(&updates[i], key, -1);
+    free(updates[i].buf);
+  }
+  free_global_e2_node_id(&node->id);
+  g_nodes[idx] = g_nodes[--g_nof_nodes];
+}
+
+/* Follows the RIC's E2 node list (a RIC from this tree sends it on every node change; the xApp library keeps it):
+ * nodes that left are dropped, new ones subscribed. A node that restarted leaves the list while it is down (a gNB
+ * restart takes well over one scan) and comes back without the xApp's subscriptions, so it is subscribed again. A new
+ * node is subscribed only once listed in two scans in a row, so that its E2 setup has completed; the nodes listed
+ * at the xApp's start are subscribed at once. */
+static void sync_nodes(srs_registry_t* reg)
+{
+  static node_key_t pending[MAX_NODES]; /* listed in the previous scan, not subscribed yet */
+  static size_t nof_pending = 0;
+  static bool first = true;
+
+  e2_node_arr_xapp_t arr = e2_nodes_xapp_api();
+  defer({ free_e2_node_arr_xapp(&arr); });
+
+  for (size_t j = 0; j < g_nof_nodes;) {
+    bool listed = false;
+    for (size_t i = 0; i < arr.len && !listed; ++i)
+      listed = same_node(g_nodes[j].key, key_from_node(&arr.n[i].id));
+    if (!listed) {
+      drop_node(j, reg);
+      continue;
+    }
+    ++j;
+  }
+
+  node_key_t next_pending[MAX_NODES];
+  size_t nof_next = 0;
+  for (size_t i = 0; i < arr.len; ++i) {
+    e2_node_connected_xapp_t const* n = &arr.n[i];
+    node_key_t const key = key_from_node(&n->id);
+    if (node_of(key) != NULL || !offers_dapp(n) || g_nof_nodes == MAX_NODES)
+      continue;
+    bool seen = first;
+    for (size_t k = 0; k < nof_pending && !seen; ++k)
+      seen = same_node(pending[k], key);
+    if (!seen || !subscribe_node(n)) {
+      if (nof_next < MAX_NODES)
+        next_pending[nof_next++] = key;
+    }
+  }
+  memcpy(pending, next_pending, nof_next * sizeof(node_key_t));
+  nof_pending = nof_next;
+  first = false;
 }
 
 /* ---- per-UE view, to tell lifecycle events from routine refreshes ------------------------------------------ */
@@ -719,7 +794,7 @@ int main(int argc, char* argv[])
   uint64_t next_alive = start + (uint64_t)(alive_s * 1e6);
   while (!g_terminate && (duration_s <= 0 || monotonic_us() - start < (uint64_t)(duration_s * 1e6))) {
     if (monotonic_us() >= next_scan) {
-      add_new_nodes();
+      sync_nodes(reg);
       expire_receivers();
       next_scan = monotonic_us() + 2000000;
     }

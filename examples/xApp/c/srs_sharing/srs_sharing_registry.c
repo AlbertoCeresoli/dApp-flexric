@@ -308,3 +308,26 @@ size_t srs_registry_snapshot(srs_registry_t* reg, uint64_t now_us, srs_packed_t*
       out[n++] = pack_ue(reg, &reg->ues[i], now_us);
   return n;
 }
+
+size_t srs_registry_release_gnb(srs_registry_t* reg, char const* plmn, uint64_t gnb_id, uint64_t now_us,
+                                srs_packed_t* out, size_t max_out)
+{
+  size_t n = 0;
+  for (size_t i = 0; i < reg->nof_ues;) {
+    ue_entry_t* e = &reg->ues[i];
+    if (strcmp(e->key.plmn, plmn) != 0 || e->key.gnb_id != gnb_id) {
+      ++i;
+      continue;
+    }
+    /* Receivers only heard of UEs with a resource, so only those need a release. */
+    if (has_resource(e) && n < max_out) {
+      SrsSharing__V1__ForeignUeUpdate update = SRS_SHARING__V1__FOREIGN_UE_UPDATE__INIT;
+      update.ue = e->config->srs_config_report->ue;
+      update.config_epoch = e->config->srs_config_report->config_epoch;
+      update.released = true;
+      out[n++] = pack_update(reg, &update, now_us);
+    }
+    remove_ue(reg, e); /* moves the last entry into slot i: look at it next */
+  }
+  return n;
+}

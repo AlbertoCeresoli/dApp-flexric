@@ -378,6 +378,43 @@ void send_setup_request(e42_xapp_t* xapp)
   xapp->handle_msg[E42_SETUP_REQUEST](xapp, NULL);
 }
 
+// [srs-sharing] A RIC built from this tree sends the E42 SETUP RESPONSE again, with the current E2 node list, each
+// time a node connects or leaves (iApp notify_e2_nodes_iapp). Once connected, the xApp takes it as an update: nodes no
+// longer listed are removed from its registry and new ones added, so e2_nodes_xapp_api() follows the RIC. A node that
+// restarted shows up as removed, then added: its subscriptions are gone and the application subscribes again.
+// Nodes listed in both are left untouched, so the registry never looks empty in between.
+static void update_e2_nodes_xapp(e42_xapp_t* xapp, e42_setup_response_t const* sr)
+{
+  e2_node_arr_t known = generate_e2_node_arr(&xapp->e2_nodes);
+  size_t added = 0, removed = 0;
+  for (size_t k = 0; k < known.len; ++k) {
+    bool listed = false;
+    for (size_t i = 0; i < sr->len_e2_nodes_conn && !listed; ++i)
+      listed = eq_global_e2_node_id(&known.n[k].id, &sr->nodes[i].id);
+    if (!listed) {
+      rm_reg_e2_node(&xapp->e2_nodes, &known.n[k].id);
+      ++removed;
+    }
+  }
+  for (size_t i = 0; i < sr->len_e2_nodes_conn; ++i) {
+    bool present = false;
+    for (size_t k = 0; k < known.len && !present; ++k)
+      present = eq_global_e2_node_id(&known.n[k].id, &sr->nodes[i].id);
+    if (present)
+      continue;
+#ifdef E2AP_V1
+    add_reg_e2_node_v1(&xapp->e2_nodes, &sr->nodes[i].id, sr->nodes[i].len_rf, sr->nodes[i].ack_rf);
+#else
+    add_reg_e2_node(&xapp->e2_nodes, &sr->nodes[i].id, sr->nodes[i].len_rf, sr->nodes[i].ack_rf,
+                    sr->nodes[i].len_cca, sr->nodes[i].cca);
+#endif
+    ++added;
+  }
+  free_e2_node_arr(&known);
+  printf("[xApp]: E2 node list from the RIC: %zu node(s) (%zu added, %zu removed)\n",
+         (size_t)sr->len_e2_nodes_conn, added, removed);
+}
+
 e2ap_msg_t e2ap_handle_e42_setup_response_xapp(e42_xapp_t* xapp, const e2ap_msg_t* msg)
 {
   assert(xapp != NULL);
@@ -387,6 +424,7 @@ e2ap_msg_t e2ap_handle_e42_setup_response_xapp(e42_xapp_t* xapp, const e2ap_msg_
   lock_guard(&xapp->conn_mtx);
 
   if(xapp->connected == true){
+    update_e2_nodes_xapp(xapp, &msg->u_msgs.e42_stp_resp); // [srs-sharing]
     e2ap_msg_t ans = {.type = NONE_E2_MSG_TYPE};
     return ans; 
   }

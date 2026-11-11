@@ -226,3 +226,27 @@ uint16_t find_map_xapps_xid(map_xapps_sockaddr_t* m, sctp_info_t const* s)
 }
 
 
+
+// [srs-sharing]
+size_t ids_map_xapps_sad(map_xapps_sockaddr_t* m, uint16_t* out, size_t max)
+{
+  assert(m != NULL);
+  assert(out != NULL || max == 0);
+
+  int rc = pthread_rwlock_rdlock(&m->rw);
+  assert(rc == 0);
+
+  assoc_rb_tree_t* tree = &m->bimap.right; // key: sctp_info_t (the address) | value: xApp ID
+  size_t n = 0;
+  void const* previous = NULL; // the tree is sorted by address: repeated addresses are next to each other
+  for (void* it = assoc_front(tree); it != assoc_end(tree) && n < max; it = assoc_next(tree, it)) {
+    void const* address = assoc_key(tree, it);
+    if (previous == NULL || tree->comp(previous, address) != 0)
+      out[n++] = *(uint16_t*)assoc_value(tree, it);
+    previous = address;
+  }
+
+  rc = pthread_rwlock_unlock(&m->rw);
+  assert(rc == 0);
+  return n;
+}

@@ -53,6 +53,11 @@ sctp_info_t find_map_xapps_sad(map_xapps_sockaddr_t* m, uint16_t xapp_id);
 
 uint16_t find_map_xapps_xid(map_xapps_sockaddr_t* m, sctp_info_t const* s);
 
+// [srs-sharing] One xApp ID per xApp address registered so far (at most max), for messages the RIC sends to every
+// xApp. An xApp that repeats its E42 SETUP REQUEST (it does while the RIC has no E2 node) gets a new ID each time,
+// all on one address: listing addresses sends it one copy, not one per ID.
+size_t ids_map_xapps_sad(map_xapps_sockaddr_t* m, uint16_t* out, size_t max);
+
 #endif
 
 

@@ -63,6 +63,13 @@ size_t srs_registry_on_payload(srs_registry_t* reg, srs_source_t src, uint8_t co
 /* Packs a ForeignUeUpdate for every UE with a known resource, e.g. for a receiving dApp that just appeared. */
 size_t srs_registry_snapshot(srs_registry_t* reg, uint64_t now_us, srs_packed_t* out, size_t max_out);
 
+/* Ends every UE served by the given gNB (its PLMN-Identity digits, e.g. "00101", and gNB ID, as in CellRef), for a
+ * node that left the RIC: its UEs are gone with it, and nobody will report their release. Writes up to max_out packed
+ * ForeignUeUpdates with released = true, one per such UE that receivers know (one with a resource), and returns how
+ * many; every such UE leaves the registry, also when out is full. */
+size_t srs_registry_release_gnb(srs_registry_t* reg, char const* plmn, uint64_t gnb_id, uint64_t now_us,
+                                srs_packed_t* out, size_t max_out);
+
 size_t srs_registry_nof_ues(srs_registry_t const* reg);
 srs_registry_stats_t srs_registry_stats(srs_registry_t const* reg);
 

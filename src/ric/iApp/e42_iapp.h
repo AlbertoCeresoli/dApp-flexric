@@ -76,6 +76,12 @@ typedef struct e42_iapp_s
 
   map_ric_id_t map_ric_id;
 
+  // [srs-sharing] xApps that disconnected, one bit per xApp ID. FlexRIC keeps every xApp it ever registered in its
+  // address map, so the E2 node list sent on every node change (notify_e2_nodes_iapp) skips these: a send to a
+  // departed xApp's address would open a new SCTP association towards a closed port.
+  pthread_mutex_t xapps_gone_mtx;
+  uint8_t xapps_gone[65536 / 8];
+
   near_ric_if_t ric_if;
 
   atomic_bool stop_token;

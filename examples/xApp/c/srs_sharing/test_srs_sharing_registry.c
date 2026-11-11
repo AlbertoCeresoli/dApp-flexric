@@ -271,6 +271,39 @@ static void test_ues_are_kept_apart(void)
   srs_registry_free(reg);
 }
 
+/* A gNB that leaves the RIC takes its UEs along: those receivers know (with a resource) get a release, all leave. */
+static void test_gnb_that_left_releases_its_ues(void)
+{
+  srs_registry_t* reg = srs_registry_new();
+  SrsSharing__V1__SrsSharingMessage* u;
+  feed(reg, config_report(0x4601, 3, CREATED, true, 7, 1), &u);
+  drop(u);
+  feed(reg, config_report(0x4602, 1, CREATED, true, 9, 2), &u);
+  drop(u);
+  feed(reg, config_report(0x4603, 1, CREATED, false, 0, 3), &u); /* no resource yet: receivers never heard of it */
+  drop(u);
+  assert(srs_registry_nof_ues(reg) == 3);
+
+  srs_packed_t out[8];
+  /* Same gNB ID, other operator: not its UEs (the lab gNBs both use gNB ID 411). */
+  assert(srs_registry_release_gnb(reg, "00102", 411, 7, out, 8) == 0);
+  assert(srs_registry_nof_ues(reg) == 3);
+
+  size_t n = srs_registry_release_gnb(reg, "00101", 411, 7, out, 8);
+  assert(n == 2);
+  uint32_t rntis = 0;
+  for (size_t i = 0; i < n; ++i) {
+    u = srs_sharing__v1__srs_sharing_message__unpack(NULL, out[i].len, out[i].buf);
+    assert(u != NULL && u->foreign_ue_update->released && u->foreign_ue_update->resource == NULL);
+    rntis |= u->foreign_ue_update->ue->rnti;
+    drop(u);
+    free(out[i].buf);
+  }
+  assert(rntis == (0x4601u | 0x4602u));
+  assert(srs_registry_nof_ues(reg) == 0);
+  srs_registry_free(reg);
+}
+
 static void test_bad_payloads_are_refused(void)
 {
   srs_registry_t* reg = srs_registry_new();
@@ -305,6 +338,7 @@ int main(void)
   test_sequence_gap_marks_the_reporters_ues();
   test_new_epoch_replaces_and_removal_releases();
   test_ues_are_kept_apart();
+  test_gnb_that_left_releases_its_ues();
   test_bad_payloads_are_refused();
   printf("SRS sharing registry tests passed\n");
   return 0;

@@ -59,6 +59,9 @@ e42_iapp_t* init_e42_iapp(const char* addr, near_ric_if_t ric_if)
 
   init_map_ric_id(&iapp->map_ric_id);
 
+  int const rc_gone = pthread_mutex_init(&iapp->xapps_gone_mtx, NULL); // [srs-sharing]
+  assert(rc_gone == 0);
+
 
   iapp->xapp_id = 7;
 
@@ -239,6 +242,10 @@ void e2_event_loop_iapp(e42_iapp_t* iapp)
           defer({free_sctp_msg(&e.msg);});
           uint16_t const xapp_id = find_map_xapps_xid(&iapp->ep.xapps, &e.msg.info);
           printf("[NEAR-RIC]: xApp %d disconnected!\n", xapp_id);
+          { // [srs-sharing] no more E2 node lists for it
+            lock_guard(&iapp->xapps_gone_mtx);
+            iapp->xapps_gone[xapp_id / 8] |= (uint8_t)(1u << (xapp_id % 8));
+          }
           rm_if_pending_subs(iapp, xapp_id);
           break;
         }
@@ -301,6 +308,36 @@ void free_e42_iapp(e42_iapp_t* iapp)
 }
 
 
+// [srs-sharing] Sends every connected xApp the current E2 node list, as an E42 SETUP RESPONSE carrying its own xApp
+// ID. FlexRIC tells an xApp the nodes only once, when it connects: a gNB that connects later, or restarts (it comes
+// back without the xApp's subscriptions), stayed invisible to it until the xApp itself was restarted. An xApp built
+// from this tree takes the repeated response as an update of its node list (msg_handler_xapp.c); called after a node
+// joined or left the iApp's registry.
+static void notify_e2_nodes_iapp(e42_iapp_t* i)
+{
+  uint16_t ids[256];
+  size_t const n = ids_map_xapps_sad(&i->ep.xapps, ids, sizeof(ids) / sizeof(ids[0]));
+  size_t sent = 0;
+  for (size_t k = 0; k < n; ++k) {
+    bool gone;
+    {
+      lock_guard(&i->xapps_gone_mtx);
+      gone = (i->xapps_gone[ids[k] / 8] >> (ids[k] % 8)) & 1u;
+    }
+    if (gone)
+      continue;
+    e2_node_arr_t nodes = generate_e2_node_arr(&i->e2_nodes);
+    e2ap_msg_t msg = {.type = E42_SETUP_RESPONSE};
+    msg.u_msgs.e42_stp_resp = (e42_setup_response_t){.xapp_id = ids[k], .len_e2_nodes_conn = nodes.len, .nodes = nodes.n};
+    byte_array_t ba = e2ap_msg_enc_iapp(&i->ap, &msg);
+    e2ap_send_bytes_iapp(&i->ep, ids[k], ba);
+    free_byte_array(ba);
+    e2ap_msg_free_iapp(&i->ap, &msg); // frees the node array too
+    ++sent;
+  }
+  printf("[iApp]: E2 node list (%zu node(s)) sent to %zu xApp(s)\n", sz_reg_e2_node(&i->e2_nodes), sent);
+}
+
 #ifdef E2AP_V1
 void add_e2_node_iapp_v1(e42_iapp_t* i, global_e2_node_id_t* id, size_t len, ran_function_t const ran_func[len])
 {
@@ -310,6 +347,7 @@ void add_e2_node_iapp_v1(e42_iapp_t* i, global_e2_node_id_t* id, size_t len, ran
   assert(ran_func != NULL);
 
   add_reg_e2_node_v1(&i->e2_nodes,id, len, ran_func);
+  notify_e2_nodes_iapp(i); // [srs-sharing]
 }
 #else
 void add_e2_node_iapp(e42_iapp_t* i, global_e2_node_id_t* id, size_t len, ran_function_t const ran_func[len], size_t len_cca, e2ap_node_component_config_add_t const* cca)
@@ -320,6 +358,7 @@ void add_e2_node_iapp(e42_iapp_t* i, global_e2_node_id_t* id, size_t len, ran_fu
   assert(ran_func != NULL);
 
   add_reg_e2_node(&i->e2_nodes,id, len, ran_func, len_cca, cca);
+  notify_e2_nodes_iapp(i); // [srs-sharing]
 }
 #endif
 
@@ -329,6 +368,7 @@ void rm_e2_node_iapp(e42_iapp_t* i, global_e2_node_id_t* id)
   assert(id != NULL);
 
   rm_reg_e2_node(&i->e2_nodes,id);
+  notify_e2_nodes_iapp(i); // [srs-sharing]
 }
 
 void notify_msg_iapp(e42_iapp_t* iapp, e2ap_msg_t const* msg)

@@ -57,9 +57,28 @@ void init_read_ind_tbl(read_ind_fp (*read_ind_tbl)[SM_AGENT_IF_READ_V0_END])
   (*read_ind_tbl)[RAN_CTRL_STATS_V1_03] = read_rc_sm;
 }
 
+// [srs-sharing] E2SM-DAPP without a RAN behind it: no E3 RAN functions to announce, and subscriptions accepted as
+// aperiodic (the dApps' reports would come from E3, which the emulator does not have). Enough for the RIC and an xApp
+// to see an E2SM-DAPP node come and go; without these the DAPP plugin called a NULL setup reader and crashed.
+static
+void read_dapp_setup_sm(void* data)
+{
+  (void)data; // the plugin fills the RAN function name itself
+}
+
+static
+sm_ag_if_ans_t write_subs_dapp_sm(void const* data)
+{
+  (void)data;
+  sm_ag_if_ans_t ans = {.type = SUBS_OUTCOME_SM_AG_IF_ANS_V0};
+  ans.subs_out.type = APERIODIC_SUBSCRIPTION_FLRC;
+  return ans;
+}
+
 static
 void init_read_setup_tbl(read_e2_setup_fp (*read_setup_tbl)[SM_AGENT_IF_E2_SETUP_ANS_V0_END])
 {
+  (*read_setup_tbl)[DAPP_AGENT_IF_E2_SETUP_ANS_V0] = read_dapp_setup_sm; // [srs-sharing]
   (*read_setup_tbl)[MAC_AGENT_IF_E2_SETUP_ANS_V0] = read_mac_setup_sm;
   (*read_setup_tbl)[RLC_AGENT_IF_E2_SETUP_ANS_V0] = read_rlc_setup_sm ;
   (*read_setup_tbl)[PDCP_AGENT_IF_E2_SETUP_ANS_V0] = read_pdcp_setup_sm ;
@@ -94,6 +113,7 @@ void init_write_subs(write_subs_fp (*write_subs_tbl)[SM_AGENT_IF_WRITE_SUBS_V0_E
   (*write_subs_tbl)[GTP_SUBS_V0] = NULL;
   (*write_subs_tbl)[KPM_SUBS_V3_0] = NULL;
   (*write_subs_tbl)[RAN_CTRL_SUBS_V1_03] = write_subs_rc_sm;
+  (*write_subs_tbl)[DAPP_SUBS_V0] = write_subs_dapp_sm; // [srs-sharing]
 }
 
 static
