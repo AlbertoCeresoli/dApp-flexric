@@ -30,8 +30,8 @@
  * leaves, and the xApp library keeps it (stock FlexRIC lists the nodes only once, when the xApp connects). A gNB that
  * connects later is then subscribed; one that leaves is dropped, with its receivers, and its UEs are released to the
  * other gNBs; one that restarts is dropped and subscribed again. As a fallback (e.g. a stock RIC), a control that the
- * RIC answers "E2 node not connected", or that gets no answer, still stops the xApp with exit status 3
- * (EXIT_NODES_CHANGED), and tools/run_xapp.sh --respawn starts it again.
+ * RIC answers "E2 node not connected" still stops the xApp with exit status 3 (EXIT_NODES_CHANGED), and
+ * tools/run_xapp.sh --respawn starts it again; a control left without an answer is only counted.
  *
  * Usage: xapp_srs_sharing -c <flexric.conf> -p <SM plugin directory>
  *        (or tools/run_xapp.sh xapp_srs_sharing); Ctrl-C stops it. SRS_XAPP_DURATION=<s> stops it after s seconds.
@@ -605,10 +605,11 @@ static bool send_control(node_t* node, uint32_t dapp_id, srs_packed_t const* p)
     g_total.controls_failed++;
     char const* reason = ans.u.reason != NULL ? ans.u.reason : "failed";
     error_line("control to dApp %u on node %s: %s", dapp_id, node_name(node->key, name, sizeof(name)), reason);
-    /* The node left (the RIC says so, or nobody answered): its subscriptions are gone even if it comes back, so stop
-     * and let a restart subscribe to the nodes connected now. A refusal by the node (e.g. a dApp that just left) is
-     * only counted. */
-    if (strcmp(reason, SYNC_UI_NODE_NOT_CONNECTED) == 0 || strcmp(reason, SYNC_UI_NO_ANSWER) == 0) {
+    /* The RIC says the node is not connected: with a stock FlexRIC the xApp would never learn when it comes back
+     * (sync_nodes needs this tree's RIC), so stop and let a restart subscribe to the nodes connected now. A control
+     * left without an answer, or refused by the node (e.g. a dApp that just left), is only counted: the next anchor
+     * refresh, within seconds, brings the receiver up to date, and a node that really left is dropped by sync_nodes. */
+    if (strcmp(reason, SYNC_UI_NODE_NOT_CONNECTED) == 0) {
       error_line("node %s is no longer connected: stopping (exit status %d) so that a restart picks up the current "
                  "E2 nodes", node_name(node->key, name, sizeof(name)), EXIT_NODES_CHANGED);
       g_exit_status = EXIT_NODES_CHANGED;
